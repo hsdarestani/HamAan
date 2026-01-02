@@ -230,6 +230,26 @@ def HealthCheckView(request):
     return JsonResponse({"status": "ok"})
 
 
+from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+
+def _load_json(request):
+    try:
+        return json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+@require_http_methods(["GET"])
+def HealthCheckView(request):
+    """
+    Lightweight health endpoint for uptime checks.
+    """
+    return JsonResponse({"status": "ok"})
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def TelegramWebhookView(request):
