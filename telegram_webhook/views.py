@@ -2,6 +2,8 @@ import json
 import os
 from typing import Any
 
+import requests
+
 from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -20,12 +22,33 @@ def _load_json(request):
         return {}
 
 
+def _telegram_request(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return None
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _extract_chat(payload: dict[str, Any]) -> dict[str, Any]:
+    if "message" in payload:
+        return payload["message"].get("chat", {}) or {}
+    if "callback_query" in payload:
+        return payload["callback_query"].get("message", {}).get("chat", {}) or {}
+    return {}
+
+
 def _get_default_bot() -> Bot | None:
     return Bot.objects.filter(is_active=True).order_by("created_at").first()
 
 
 def _touch_user(telegram_payload: dict[str, Any]) -> User:
-    chat = telegram_payload.get("message", {}).get("chat", {}) or telegram_payload.get("callback_query", {}).get("message", {}).get("chat", {})
+    chat = _extract_chat(telegram_payload)
     telegram_id = chat.get("id")
     username = chat.get("username", "")
     first_name = chat.get("first_name", "")
@@ -159,16 +182,38 @@ def _settings_reply():
     return _reply_payload("تنظیمات ساده:\n- کم‌حرف‌تر باش\n- یه کم بیشتر بپرس\n- ربات گاهی سر بزنه / نزنه\n- پاک کردن داده‌ها (اختیاری)")
 
 
+def _send_replies(chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None) -> bool:
+    success = True
+    for reply in replies:
+        payload = {"chat_id": chat_id, "text": reply["text"]}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply.get("reply_markup"):
+            payload["reply_markup"] = reply["reply_markup"]
+        if reply.get("parse_mode"):
+            payload["parse_mode"] = reply["parse_mode"]
+        res = _telegram_request("sendMessage", payload)
+        success = success and bool(res and res.get("ok"))
+    return success
+
+
+def _answer_callback_query(callback_query_id: str):
+    if not callback_query_id:
+        return
+    _telegram_request("answerCallbackQuery", {"callback_query_id": callback_query_id})
+
+
 def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, Any]):
     conversation = _ensure_conversation(user, bot)
     if not conversation:
         return [_reply_payload("هیچ بات فعالی پیدا نشد.")]
 
+    message_meta = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
     normalized = (text or "").strip()
     if normalized in {"/start", "start"}:
         return _start_replies()
     if normalized in {"شروع کنیم", "start_now"}:
-        _record_user_message(conversation, text, update.get("message", {}))
+        _record_user_message(conversation, text, message_meta)
         return [_reply_payload("هرچی هست همین‌جا بگو.")]
     if normalized in {"یه کم درباره‌اش بگو", "about"}:
         return _about_replies()
@@ -195,7 +240,7 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
         ]
 
     # Regular chat flow
-    _record_user_message(conversation, text, update.get("message", {}))
+    _record_user_message(conversation, text, message_meta)
     wallet = ensure_wallet(user)
     if wallet.balance <= 0:
         return _paywall_replies()
@@ -230,26 +275,6 @@ def HealthCheckView(request):
     return JsonResponse({"status": "ok"})
 
 
-from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
-
-
-def _load_json(request):
-    try:
-        return json.loads(request.body or "{}")
-    except json.JSONDecodeError:
-        return {}
-
-
-@require_http_methods(["GET"])
-def HealthCheckView(request):
-    """
-    Lightweight health endpoint for uptime checks.
-    """
-    return JsonResponse({"status": "ok"})
-
-
 @csrf_exempt
 @require_http_methods(["POST"])
 def TelegramWebhookView(request):
@@ -272,7 +297,24 @@ def TelegramWebhookView(request):
         return HttpResponseBadRequest("missing chat.id")
 
     replies = _handle_message(user, bot, text, payload)
-    return JsonResponse({"ok": True, "replies": replies})
+    chat = _extract_chat(payload)
+    chat_id = chat.get("id")
+    message_id = None
+    callback_id = None
+    if "message" in payload:
+        message_id = payload["message"].get("message_id")
+    if "callback_query" in payload:
+        callback_id = payload["callback_query"].get("id")
+        message_id = payload["callback_query"].get("message", {}).get("message_id")
+
+    send_ok = False
+    if chat_id and replies:
+        send_ok = _send_replies(chat_id, replies, reply_to_message_id=message_id)
+    if callback_id:
+        _answer_callback_query(callback_id)
+
+    token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
+    return JsonResponse({"ok": True, "replies_sent": send_ok, "token_present": token_present})
 
 
 @csrf_exempt
