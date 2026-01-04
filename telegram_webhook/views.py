@@ -2,6 +2,8 @@ import json
 import os
 from typing import Any
 
+import logging
+
 import requests
 
 from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
@@ -15,23 +17,29 @@ from persona.models import Bot, BotUserState
 from users.models import User
 
 
+logger = logging.getLogger(__name__)
+
+
 def _load_json(request):
     try:
         return json.loads(request.body or "{}")
     except json.JSONDecodeError:
+        logger.warning("telegram_webhook: invalid JSON body")
         return {}
 
 
 def _telegram_request(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
+        logger.warning("telegram_webhook: missing TELEGRAM_BOT_TOKEN env, cannot send %s", method)
         return None
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
         resp = requests.post(url, json=payload, timeout=5)
         resp.raise_for_status()
         return resp.json()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("telegram_webhook: failed %s with payload=%s error=%s", method, payload, exc)
         return None
 
 
@@ -206,6 +214,7 @@ def _answer_callback_query(callback_query_id: str):
 def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, Any]):
     conversation = _ensure_conversation(user, bot)
     if not conversation:
+        logger.error("telegram_webhook: no active bot for user=%s", user.id)
         return [_reply_payload("هیچ بات فعالی پیدا نشد.")]
 
     message_meta = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
@@ -231,6 +240,7 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
         try:
             pack = CoinPack.objects.get(code=code, is_active=True)
         except CoinPack.DoesNotExist:
+            logger.warning("telegram_webhook: pack not found code=%s user=%s", code, user.id)
             return [_reply_payload("این بسته وجود ندارد.")]
         purchase = _create_purchase(user, pack)
         pay_link = f"https://pay.example.com/{purchase.id}"
@@ -254,7 +264,8 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
             ref_type="message",
             ref_id=str(bot_reply.id),
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("telegram_webhook: coin debit failed user=%s conv=%s error=%s", user.id, conversation.id, exc)
         return _paywall_replies()
     return [_reply_payload(bot_reply.text)]
 
@@ -289,11 +300,13 @@ def TelegramWebhookView(request):
         return HttpResponseForbidden("forbidden")
 
     payload = _load_json(request)
+    logger.info("telegram_webhook: incoming payload keys=%s", list(payload.keys()))
     text = _extract_text(payload)
     bot = _get_default_bot()
     try:
         user = _touch_user(payload)
     except ValueError:
+        logger.error("telegram_webhook: missing chat.id in payload=%s", payload)
         return HttpResponseBadRequest("missing chat.id")
 
     replies = _handle_message(user, bot, text, payload)
@@ -310,6 +323,14 @@ def TelegramWebhookView(request):
     send_ok = False
     if chat_id and replies:
         send_ok = _send_replies(chat_id, replies, reply_to_message_id=message_id)
+        logger.info(
+            "telegram_webhook: sent replies=%s chat_id=%s message_id=%s callback=%s ok=%s",
+            len(replies),
+            chat_id,
+            message_id,
+            callback_id,
+            send_ok,
+        )
     if callback_id:
         _answer_callback_query(callback_id)
 
