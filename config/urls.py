@@ -21,5 +21,11 @@ urlpatterns = [
     path('admin/', admin.site.urls),
 
     path("", include("telegram_webhook.urls")),
+    path("users/", include("users.urls")),
+    path("bots/", include("persona.urls")),
+    path("chat/", include("chat.urls")),
+    path("billing/", include("billing.urls")),
+    path("automation/", include("automation.urls")),
+    path("safety/", include("safety.urls")),
 
 ]
