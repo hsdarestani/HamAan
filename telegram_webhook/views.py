@@ -1,10 +1,11 @@
+import logging
 import json
 import os
+import time
 from typing import Any
 
-import logging
-
 import requests
+from openai import OpenAI
 
 from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
 from django.utils import timezone
@@ -12,12 +13,13 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from billing.models import CoinPack, CoinTxn, Purchase, apply_coin_txn, ensure_wallet
-from chat.models import Conversation, Message, next_message_seq
+from chat.models import Conversation, LLMCallLog, Message, next_message_seq
 from persona.models import Bot, BotUserState
 from users.models import User
 
 
 logger = logging.getLogger(__name__)
+openai_client = OpenAI()
 
 
 def _load_json(request):
@@ -124,8 +126,25 @@ def _about_replies():
 
 
 def _manual_bot_reply(conversation: Conversation, text: str) -> Message:
+    return _record_bot_message(conversation, text)
+
+
+def _record_bot_message(
+    conversation: Conversation,
+    text: str,
+    *,
+    token_in: int = 0,
+    token_out: int = 0,
+) -> Message:
     seq = next_message_seq(conversation.id)
-    msg = Message.objects.create(conversation=conversation, role=Message.Role.BOT, text=text, seq=seq)
+    msg = Message.objects.create(
+        conversation=conversation,
+        role=Message.Role.BOT,
+        text=text or "",
+        seq=seq,
+        token_in=token_in,
+        token_out=token_out,
+    )
     now = timezone.now()
     Conversation.objects.filter(id=conversation.id).update(
         last_activity_at=now, last_bot_reply_at=now, has_unread_bot_message=True, updated_at=now
@@ -188,6 +207,79 @@ def _paywall_replies():
 
 def _settings_reply():
     return _reply_payload("تنظیمات ساده:\n- کم‌حرف‌تر باش\n- یه کم بیشتر بپرس\n- ربات گاهی سر بزنه / نزنه\n- پاک کردن داده‌ها (اختیاری)")
+
+
+def _recent_messages(conversation: Conversation, limit: int = 10):
+    history = list(conversation.messages.order_by("-seq")[:limit])
+    history.reverse()
+    return history
+
+
+def _build_llm_messages(bot: Bot, conversation: Conversation):
+    base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
+    system_prompt = (
+        base_prompt
+        or "تو یک همراه گفت‌وگوی کوتاه و مهربان هستی. با لحن ساده و دوستانه پاسخ بده، کوتاه و بدون نصیحت یا پرسش‌های زیاد. "
+        "اگر کاربر خواست، فقط شنونده باش و بیشتر از یک سؤال در هر پاسخ نپرس. پاسخ‌ها را به فارسی بنویس."
+    )
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for msg in _recent_messages(conversation):
+        if msg.role == Message.Role.USER:
+            role = "user"
+        elif msg.role == Message.Role.BOT:
+            role = "assistant"
+        else:
+            role = "system"
+        messages.append({"role": role, "content": msg.text})
+    return messages
+
+
+def _generate_ai_reply(conversation: Conversation, bot: Bot) -> dict[str, Any] | None:
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.warning("telegram_webhook: missing OPENAI_API_KEY")
+        return None
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    prompt_messages = _build_llm_messages(bot, conversation)
+    log = LLMCallLog.objects.create(
+        conversation=conversation,
+        provider=LLMCallLog.Provider.OPENAI,
+        model=model,
+        status=LLMCallLog.Status.OK,
+        prompt_meta={"message_count": len(prompt_messages)},
+    )
+    started = time.monotonic()
+    try:
+        response = openai_client.chat.completions.create(
+            model=model,
+            messages=prompt_messages,
+            temperature=0.6,
+            max_tokens=min(256, bot.max_output_chars * 2),
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        usage = getattr(response, "usage", None)
+        token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
+        token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
+        reply_text = (response.choices[0].message.content or "").strip()
+        if not reply_text:
+            return None
+
+        log.latency_ms = latency_ms
+        log.token_in = token_in
+        log.token_out = token_out
+        log.request_id = getattr(response, "id", "")
+        log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
+        return {"text": reply_text, "token_in": token_in, "token_out": token_out}
+    except Exception as exc:  # noqa: BLE001
+        latency_ms = int((time.monotonic() - started) * 1000)
+        log.status = LLMCallLog.Status.ERROR
+        log.error_message = str(exc)[:255]
+        log.latency_ms = latency_ms
+        log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
+        logger.exception(
+            "telegram_webhook: openai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+        )
+        return None
 
 
 def _send_replies(chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None) -> bool:
@@ -255,7 +347,17 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
     if wallet.balance <= 0:
         return _paywall_replies()
 
-    bot_reply = _manual_bot_reply(conversation, "شنیدم. هرچی تو ذهنته بگو.")
+    generation = _generate_ai_reply(conversation, bot)
+    if not generation:
+        bot_reply = _record_bot_message(conversation, "فعلاً نمی‌تونم جواب بدم. کمی بعد دوباره امتحان کن.")
+        return [_reply_payload(bot_reply.text)]
+
+    bot_reply = _record_bot_message(
+        conversation,
+        generation["text"],
+        token_in=generation["token_in"],
+        token_out=generation["token_out"],
+    )
     try:
         apply_coin_txn(
             user=user,
