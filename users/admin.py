@@ -15,6 +15,7 @@ class UserAdmin(admin.ModelAdmin):
         "is_blocked",
         "last_seen_at",
         "last_message_at",
+        "assigned_bot",
     )
     list_filter = (
         "is_active",
@@ -27,6 +28,7 @@ class UserAdmin(admin.ModelAdmin):
     )
     search_fields = ("telegram_id", "telegram_username", "first_name", "last_name")
     readonly_fields = ("created_at", "updated_at", "first_seen_at", "last_seen_at", "last_message_at")
+    raw_id_fields = ("assigned_bot",)
     ordering = ("-created_at",)
 
 
