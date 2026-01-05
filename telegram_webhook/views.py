@@ -479,6 +479,38 @@ def _mode_instruction(mode: str) -> str:
     return "mode=idle: پاسخ بسیار کوتاه و بدون سؤال."
 
 
+def _identity_profile_instruction(identity: BotIdentity | None) -> str:
+    if not identity:
+        return ""
+
+    profile = identity.identity_profile or {}
+
+    def _clean_list(key: str) -> list[str]:
+        raw = profile.get(key) or []
+        return [str(item).strip() for item in raw if str(item).strip()][:3]
+
+    favorites = _clean_list("favorites")
+    dreams = _clean_list("dreams")
+    values = _clean_list("values")
+
+    parts = []
+    if favorites:
+        parts.append(f"علاقه‌مندی‌ها: {', '.join(favorites)}")
+    if dreams:
+        parts.append(f"رویاها: {', '.join(dreams)}")
+    if values:
+        parts.append(f"ارزش‌ها: {', '.join(values)}")
+
+    if not parts:
+        return ""
+
+    return (
+        "پروفایل روایی ربات → "
+        + " | ".join(parts)
+        + ". می‌توانی گاهی یک اشاره کوتاه و طبیعی به یکی از این موارد داشته باشی؛ داستان‌پردازی یا اغراق نکن."
+    )
+
+
 def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
     if not state and not identity:
         return (
@@ -505,6 +537,10 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
             pieces.append("خروجی را مختصر نگه دار و اگر لازم بود یک جمله توضیح اضافه کن.")
         else:
             pieces.append("اگر نکته مهمی وجود دارد، نهایتاً سه جمله بنویس اما هنوز فشرده بمان.")
+
+        profile_hint = _identity_profile_instruction(identity)
+        if profile_hint:
+            pieces.append(profile_hint)
 
     if state:
         def _bucket(value: float, low: float, mid: float):
