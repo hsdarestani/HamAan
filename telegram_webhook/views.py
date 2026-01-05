@@ -318,7 +318,7 @@ def _split_reply(text: str, limit: int) -> list[str]:
 def _persona_style_instructions(state: BotUserState | None, bot: Bot) -> str:
     if not state:
         return (
-            "کوتاه و دوستانه جواب بده؛ بیش از یک سؤال نپرس مگر کاربر خواست؛ "
+            "کوتاه و دوستانه جواب بده؛ اگر question_budget=0 بود سؤال نپرس؛ "
             "از نصیحت یا لحن درمانی دوری کن."
         )
 
@@ -340,14 +340,16 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot) -> str:
     questions_level = _bucket(state.user_pref_questions, 0.2, 0.6)
     if questions_level == "low":
         max_questions = 0
-        questions_rule = "سؤال نپرس مگر کاربر خودش درخواست کند."
+        questions_rule = "سؤال نپرس مگر کاربر خودش درخواست کند یا ابهام جدی باشد و question_budget اجازه بدهد."
     elif questions_level == "mid":
         max_questions = min(1, bot.max_questions_per_reply)
-        questions_rule = "در هر جواب حداکثر یک سؤال بپرس و فقط وقتی به ادامه گفتگو کمک می‌کند."
+        questions_rule = (
+            "در هر جواب حداکثر یک سؤال بپرس و فقط وقتی به ادامه گفتگو کمک می‌کند و question_budget=1 است."
+        )
     else:
         max_questions = min(2, bot.max_questions_per_reply)
         questions_rule = (
-            f"در هر جواب حداکثر {max_questions} سؤال کوتاه بپرس و از پرسیدن بیشتر خودداری کن."
+            f"در هر جواب حداکثر {max_questions} سؤال کوتاه و مشخص بپرس، فقط وقتی question_budget=1 و واقعاً ابهام داری."
         )
 
     closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
@@ -364,7 +366,62 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot) -> str:
     )
 
 
-def _response_template_hint(normalized_user_text: str, conversation: Conversation) -> str:
+def _question_budget_decision(normalized_user_text: str) -> tuple[int, str]:
+    text = normalized_user_text.strip()
+    if not text:
+        return 1, "متن خالی یا نامفهوم بود"
+
+    has_question_mark = "?" in text or "؟" in text
+    closing_keywords = {"مرسی", "ممنون", "خدافظ", "خداحافظ", "فعلاً", "بای"}
+    if any(k in text for k in closing_keywords):
+        return 0, "حالت خداحافظی/بستن گفتگو"
+
+    greeting_keywords = {"سلام", "درود", "hi", "hello"}
+    tokens = text.split()
+    word_count = len(tokens)
+    if any(k in text for k in greeting_keywords) and word_count <= 4 and not has_question_mark:
+        return 0, "سلام یا شروع کوتاه بدون ابهام"
+
+    vague_markers = {"کمک", "مشکل", "مسئله", "مسأله", "سوال", "سؤال", "گیر کردم", "نمی‌دانم", "نمیدونم"}
+    if word_count <= 3 and any(marker in text for marker in vague_markers) and not has_question_mark:
+        return 1, "درخواست کلی و مبهم است"
+
+    if word_count <= 2 and not has_question_mark:
+        return 1, "جمله خیلی کوتاه و بدون پرسش است"
+
+    return 0, "درخواست برای پاسخ کافی است"
+
+
+def _question_policy_instructions(question_budget: int, budget_reason: str) -> str:
+    return (
+        f"question_budget={question_budget} (۰ یعنی هیچ سؤالی مجاز نیست؛ ۱ یعنی حداکثر یک سؤال کوتاه برای رفع ابهام). "
+        f"دلیل بودجه: {budget_reason}. "
+        "سه حالت خروجی داری: [A] پاسخ مستقیم بدون سؤال؛ [B] پاسخ + یک پیشنهاد اختیاری به صورت جمله خبری بدون علامت سؤال؛ "
+        "[C] فقط یک سؤال دقیق برای رفع ابهام، آن هم وقتی بدون آن نمی‌توانی پاسخ روشنی بدهی. همیشه A یا B را ترجیح بده مگر واقعاً ابهام مانع پاسخ باشد. "
+        "اگر question_budget=0 یا ابهام جدی نیست، هیچ علامت سؤال نگذار و حالت C را استفاده نکن."
+    )
+
+
+def _apply_question_budget_to_reply(reply_text: str, question_budget: int) -> str:
+    if question_budget > 0:
+        return reply_text
+
+    stripped = reply_text.rstrip()
+    if not stripped:
+        return reply_text
+
+    if stripped.endswith("?") or stripped.endswith("؟"):
+        stripped = stripped.rstrip("؟?").rstrip()
+        if stripped and stripped[-1] not in {".", "!", "؟", "!", "…"}:
+            stripped = f"{stripped}."
+        return stripped
+
+    return reply_text
+
+
+def _response_template_hint(
+    normalized_user_text: str, conversation: Conversation, question_budget: int
+) -> str:
     text = normalized_user_text
     lower = text.lower()
     is_question = "?" in text or "؟" in text
@@ -375,32 +432,49 @@ def _response_template_hint(normalized_user_text: str, conversation: Conversatio
     is_feeling = any(k in text for k in feeling_keywords)
     long_chat = conversation.messages.count() >= 8
 
+    followup_hint = "بدون سؤال" if question_budget == 0 else "سؤال فقط اگر ابهام واقعی داری"
+
     if has_closing:
-        template = "جمع‌بندی: دو نکته مهم را یادآوری کن، یک خداحافظی محترمانه یا پیشنهاد ادامه در آینده."
+        template = "جمع‌بندی: دو نکته مهم را یادآوری کن و خداحافظی محترمانه داشته باش؛ سؤال نپرس."
     elif is_feeling and not is_question:
-        template = "همدلی: یک جمله همدلانه و بازتاب احساس، یک یادآوری کوتاه که گوش می‌دهی، و فقط در صورت تمایل کاربر یک سؤال نرم."
+        template = (
+            "همدلی: یک جمله همدلانه و بازتاب احساس، یک یادآوری کوتاه که گوش می‌دهی، "
+            "و فقط در صورت ابهام جدی یک سؤال نرم."
+        )
     elif is_question:
-        template = "راهنمایی/اطلاعاتی: بازتاب کوتاه، پاسخ روشن و کاربردی، و اگر لازم بود یک قدم بعدی یا سؤال دقیق."
+        template = "راهنمایی/اطلاعاتی: بازتاب کوتاه، پاسخ روشن و کاربردی، و نهایتاً یک قدم بعدی خبری؛ "
+        if question_budget == 1:
+            template += "اگر جواب دقیق نیازمند داده بیشتر بود، یک سؤال مشخص بپرس."
     elif long_chat and not short_length:
-        template = "پیگیری: یادآوری کوتاه موضوع قبلی، یک سؤال مشخص برای ادامه، و یک پیشنهاد کوچک."
+        template = "پیگیری: یادآوری کوتاه موضوع قبلی، یک پیشنهاد کوچک یا قدم بعدی خبری، و سؤال فقط اگر واقعاً لازم بود."
     else:
-        template = "اطلاعاتی: بازتاب کوتاه، پاسخ مستقیم، و یک سؤال دقیق فقط اگر کمک می‌کند."
+        template = f"اطلاعاتی: بازتاب کوتاه، پاسخ مستقیم، و {followup_hint}."
 
     return f"الگوی پاسخ پیشنهادی ({template})"
 
 
-def _build_llm_messages(bot: Bot, conversation: Conversation, state: BotUserState | None, normalized_user_text: str):
+def _build_llm_messages(
+    bot: Bot,
+    conversation: Conversation,
+    state: BotUserState | None,
+    normalized_user_text: str,
+    question_budget: int,
+    budget_reason: str,
+):
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
         base_prompt
-        or "تو یک همراه گفت‌وگوی مهربان هستی. در هر پاسخ سه گام داشته باش: "
-        "۱) یک جمله کوتاه که حرف یا حال کاربر را بازتاب دهد؛ ۲) یک جواب روشن و مشخص بده؛ "
-        "۳) فقط اگر واقعاً لازم است یک سؤال دقیق برای ادامه بپرس. پاسخ‌ها را به فارسی و ساده بنویس."
+        or "تو یک همراه گفت‌وگوی مهربان هستی. پاسخ‌ها را به فارسی و ساده بنویس؛ ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
+        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد."
     )
     persona_rules = _persona_style_instructions(state, bot)
-    system_prompt = f"{system_prompt}\n{persona_rules}"
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    template_hint = _response_template_hint(normalized_user_text, conversation)
+    policy_hint = _question_policy_instructions(question_budget, budget_reason)
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": persona_rules},
+        {"role": "system", "content": policy_hint},
+    ]
+    template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
     messages.append({"role": "system", "content": template_hint})
     summary = (conversation.memory_summary or "").strip()
     if summary:
@@ -423,13 +497,25 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
-    prompt_messages = _build_llm_messages(bot, conversation, state, normalized_user_text)
+    question_budget, budget_reason = _question_budget_decision(normalized_user_text)
+    prompt_messages = _build_llm_messages(
+        bot,
+        conversation,
+        state,
+        normalized_user_text,
+        question_budget,
+        budget_reason,
+    )
     log = LLMCallLog.objects.create(
         conversation=conversation,
         provider=LLMCallLog.Provider.OPENAI,
         model=model,
         status=LLMCallLog.Status.OK,
-        prompt_meta={"message_count": len(prompt_messages)},
+        prompt_meta={
+            "message_count": len(prompt_messages),
+            "question_budget": question_budget,
+            "budget_reason": budget_reason,
+        },
     )
     started = time.monotonic()
     try:
@@ -444,7 +530,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         usage = getattr(response, "usage", None)
         token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
         token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
-        reply_text = (response.choices[0].message.content or "").strip()
+        reply_text = _apply_question_budget_to_reply(
+            (response.choices[0].message.content or "").strip(), question_budget
+        )
         if not reply_text:
             return None
 
