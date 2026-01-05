@@ -102,6 +102,22 @@ def _get_default_bot() -> Bot | None:
     return Bot.objects.filter(is_active=True).order_by("created_at").first()
 
 
+def _resolve_user_bot(user: User) -> Bot | None:
+    """
+    Ensure every user has a persistent bot anchor.
+    - If user.assigned_bot is set, prefer it.
+    - Otherwise, pick the default bot and assign it to the user for future requests.
+    """
+    if user.assigned_bot:
+        return user.assigned_bot
+
+    bot = _get_default_bot()
+    if bot:
+        user.assigned_bot = bot
+        user.save(update_fields=["assigned_bot", "updated_at"])
+    return bot
+
+
 def _touch_user(telegram_payload: dict[str, Any]) -> User:
     chat = _extract_chat(telegram_payload)
     telegram_id = chat.get("id")
@@ -116,7 +132,12 @@ def _touch_user(telegram_payload: dict[str, Any]) -> User:
         "last_name": last_name or "",
         "last_seen_at": timezone.now(),
     }
-    user, _ = User.objects.update_or_create(telegram_id=int(telegram_id), defaults=defaults)
+    user, created = User.objects.update_or_create(telegram_id=int(telegram_id), defaults=defaults)
+    if created and not user.assigned_bot:
+        default_bot = _get_default_bot()
+        if default_bot:
+            user.assigned_bot = default_bot
+            user.save(update_fields=["assigned_bot", "updated_at"])
     ensure_wallet(user)
     return user
 
@@ -890,12 +911,13 @@ def TelegramWebhookView(request):
     payload = _load_json(request)
     logger.info("telegram_webhook: incoming payload keys=%s", list(payload.keys()))
     text = _extract_text(payload)
-    bot = _get_default_bot()
     try:
         user = _touch_user(payload)
     except ValueError:
         logger.error("telegram_webhook: missing chat.id in payload=%s", payload)
         return HttpResponseBadRequest("missing chat.id")
+
+    bot = _resolve_user_bot(user)
 
     replies = _handle_message(user, bot, text, payload)
     chat = _extract_chat(payload)

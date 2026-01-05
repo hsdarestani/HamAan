@@ -90,6 +90,15 @@ class User(AbstractBaseUser, PermissionsMixin, TimeStampedModel):
     # Locale/time settings (keep simple; can be refined later)
     timezone = models.CharField(max_length=64, blank=True, default="Asia/Tehran", db_index=True)
 
+    # Persistent default bot assignment (per-user anchor to a persona)
+    assigned_bot = models.ForeignKey(
+        "persona.Bot",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="assigned_users",
+    )
+
     # Privacy / user controls
     marketing_opt_in = models.BooleanField(default=False)
     initiation_opt_in = models.BooleanField(default=True)  # allow the bot to initiate messages
@@ -181,4 +190,3 @@ class UserPrefs(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"UserPrefs({self.user_id})"
-
