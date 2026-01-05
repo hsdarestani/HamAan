@@ -9,6 +9,7 @@ from django.views.decorators.http import require_http_methods
 
 from automation.models import InitiationEvent, InitiationRule
 from persona.models import Bot, BotIdentity, BotUserState, MemoryFragment
+from persona.relationship_memory import update_relationship_memory
 from safety.models import BlockedPhrase, SafetyEvent, UserRestriction
 from users.models import User, UserPrefs
 from .models import Conversation, LLMCallLog, Message, next_message_seq
@@ -257,6 +258,8 @@ def _create_message(conversation, role, text, telegram_ids=None):
 
     # Seed or reinforce lightweight memory fragments from the interaction
     _upsert_memory_fragment(state, text, now, source_ref=message.id)
+    if role == Message.Role.USER:
+        update_relationship_memory(state, text or "")
 
     updates = {"last_activity_at": now, "updated_at": now}
     if role == Message.Role.USER:

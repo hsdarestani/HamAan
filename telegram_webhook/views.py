@@ -16,6 +16,7 @@ from django.views.decorators.http import require_http_methods
 from billing.models import CoinPack, CoinTxn, Purchase, apply_coin_txn, ensure_wallet
 from chat.models import Conversation, LLMCallLog, Message, next_message_seq
 from persona.models import Bot, BotIdentity, BotUserState
+from persona.relationship_memory import update_relationship_memory
 from users.models import User
 
 
@@ -348,6 +349,9 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
     Conversation.objects.filter(id=conversation.id).update(
         last_activity_at=now, last_user_message_at=now, has_unread_bot_message=False, updated_at=now
     )
+    state = BotUserState.objects.filter(bot=conversation.bot, user=conversation.user).first()
+    if state:
+        update_relationship_memory(state, text or "")
     _refresh_memory_summary(conversation)
     return msg
 
