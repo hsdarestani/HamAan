@@ -2,12 +2,15 @@ import json
 from uuid import UUID
 
 from django.http import HttpResponseBadRequest, JsonResponse
+from django.db.models import F
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from persona.models import Bot
-from users.models import User
+from automation.models import InitiationEvent, InitiationRule
+from persona.models import Bot, BotIdentity, BotUserState, MemoryFragment
+from safety.models import BlockedPhrase, SafetyEvent, UserRestriction
+from users.models import User, UserPrefs
 from .models import Conversation, LLMCallLog, Message, next_message_seq
 
 
@@ -52,6 +55,83 @@ def _get_conversation_from_request(data, query_params):
     return None
 
 
+def _ensure_user_context(user, bot):
+    """
+    Ensure all per-user/per-bot companion models exist for downstream updates.
+    """
+    prefs, _ = UserPrefs.objects.get_or_create(user=user)
+    UserRestriction.objects.get_or_create(user=user)
+    state, _ = BotUserState.objects.get_or_create(user=user, bot=bot)
+    InitiationRule.objects.get_or_create(bot=bot)
+    BotIdentity.objects.get_or_create(bot=bot)
+    return state, prefs
+
+
+def _touch_user_prefs_counts(user_id, role, now):
+    updates = {"updated_at": now}
+    if role == Message.Role.USER:
+        updates["total_user_messages"] = F("total_user_messages") + 1
+    elif role == Message.Role.BOT:
+        updates["total_bot_replies"] = F("total_bot_replies") + 1
+    UserPrefs.objects.filter(user_id=user_id).update(**updates)
+
+
+def _ack_initiation_if_needed(state_id, now):
+    latest = (
+        InitiationEvent.objects.filter(state_id=state_id, status=InitiationEvent.Status.SENT)
+        .order_by("-scheduled_for", "-created_at")
+        .first()
+    )
+    if latest and not latest.user_replied:
+        InitiationEvent.objects.filter(id=latest.id).update(
+            user_replied=True, user_replied_at=now, status=InitiationEvent.Status.ACKED, updated_at=now
+        )
+
+
+def _maybe_log_blocked_phrase(user_id, conversation_id, message_id, text):
+    text_lower = (text or "").lower()
+    if not text_lower:
+        return
+    for phrase in BlockedPhrase.objects.filter(is_active=True):
+        if phrase.phrase.lower() in text_lower:
+            SafetyEvent.objects.create(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                event_type=phrase.event_type,
+                severity=phrase.severity,
+                rule_key="blocked_phrase",
+                summary=f"Matched phrase: {phrase.phrase}",
+                payload={"matched_phrase": phrase.phrase},
+            )
+            break
+
+
+def _upsert_memory_fragment(state, text, now, source_ref):
+    topic = (state.bot.default_language or "general")[:64]
+    text_snippet = (text or "").strip()[:220]
+    if not text_snippet:
+        text_snippet = "interaction"
+    fragment, created = MemoryFragment.objects.get_or_create(
+        state=state,
+        topic=topic,
+        defaults={
+            "kind": MemoryFragment.Kind.TOPIC,
+            "hint_text": text_snippet,
+            "confidence": 0.55,
+            "source_ref": str(source_ref),
+            "last_seen_at": now,
+        },
+    )
+    if not created:
+        MemoryFragment.objects.filter(id=fragment.id).update(
+            hint_text=text_snippet,
+            last_seen_at=now,
+            times_reinforced=F("times_reinforced") + 1,
+            source_ref=str(source_ref),
+        )
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def ConversationCreateOrGetView(request):
@@ -67,6 +147,8 @@ def ConversationCreateOrGetView(request):
         status=Conversation.Status.ACTIVE,
         defaults={"last_activity_at": timezone.now()},
     )
+    _ensure_user_context(user, bot)
+    User.objects.filter(id=user.id).update(last_seen_at=timezone.now(), updated_at=timezone.now())
     if not created:
         Conversation.objects.filter(id=conversation.id).update(last_activity_at=timezone.now())
     return JsonResponse({"ok": True, "conversation_id": str(conversation.id), "created": created})
@@ -139,6 +221,27 @@ def MessageListView(request):
 
 
 def _create_message(conversation, role, text, telegram_ids=None):
+    now = timezone.now()
+
+    # Ensure persona/user state exists and update per-role counters/timestamps
+    state, _ = _ensure_user_context(conversation.user, conversation.bot)
+    if role == Message.Role.USER:
+        BotUserState.objects.filter(id=state.id).update(
+            last_user_message_at=now, total_user_messages=F("total_user_messages") + 1, updated_at=now
+        )
+        _ack_initiation_if_needed(state.id, now)
+    elif role == Message.Role.BOT:
+        BotUserState.objects.filter(id=state.id).update(
+            last_bot_reply_at=now, total_bot_replies=F("total_bot_replies") + 1, updated_at=now
+        )
+    _touch_user_prefs_counts(conversation.user_id, role, now)
+
+    # Track user activity
+    user_updates = {"last_seen_at": now, "updated_at": now}
+    if role == Message.Role.USER:
+        user_updates["last_message_at"] = now
+    User.objects.filter(id=conversation.user_id).update(**user_updates)
+
     seq = next_message_seq(conversation.id)
     message = Message.objects.create(
         conversation=conversation,
@@ -148,7 +251,13 @@ def _create_message(conversation, role, text, telegram_ids=None):
         telegram_message_id=(telegram_ids or {}).get("telegram_message_id"),
         telegram_update_id=(telegram_ids or {}).get("telegram_update_id"),
     )
-    now = timezone.now()
+
+    if role == Message.Role.USER:
+        _maybe_log_blocked_phrase(conversation.user_id, conversation.id, message.id, text)
+
+    # Seed or reinforce lightweight memory fragments from the interaction
+    _upsert_memory_fragment(state, text, now, source_ref=message.id)
+
     updates = {"last_activity_at": now, "updated_at": now}
     if role == Message.Role.USER:
         updates["last_user_message_at"] = now
