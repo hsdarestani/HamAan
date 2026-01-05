@@ -1,9 +1,10 @@
-import logging
 import json
+import logging
 import os
 import time
 from typing import Any
 
+from datetime import datetime
 import requests
 from openai import OpenAI
 
@@ -14,8 +15,17 @@ from django.views.decorators.http import require_http_methods
 
 from billing.models import CoinPack, CoinTxn, Purchase, apply_coin_txn, ensure_wallet
 from chat.models import Conversation, LLMCallLog, Message, next_message_seq
-from persona.models import Bot, BotUserState
+from persona.models import Bot, BotIdentity, BotUserState
 from users.models import User
+
+
+class Intent:
+    def __init__(self, kind: str, data: dict[str, Any] | None = None):
+        self.kind = kind
+        self.data = data or {}
+
+    def __repr__(self) -> str:
+        return f"Intent(kind={self.kind}, data={self.data})"
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +61,41 @@ def _extract_chat(payload: dict[str, Any]) -> dict[str, Any]:
     if "callback_query" in payload:
         return payload["callback_query"].get("message", {}).get("chat", {}) or {}
     return {}
+
+
+def _detect_intent(text: str) -> Intent:
+    normalized = (text or "").strip()
+    lower = normalized.lower()
+    key_phrases = lower.replace("‌", " ")
+
+    def _has_any(options: set[str]) -> bool:
+        return any(opt in key_phrases for opt in options)
+
+    if normalized in {"/start", "start"}:
+        return Intent("start")
+    if normalized in {"شروع کنیم", "start_now"}:
+        return Intent("start_now")
+    if normalized in {"یه کم درباره‌اش بگو", "about"}:
+        return Intent("about")
+    if normalized in {"یه سؤال دقیق‌تر بپرس", "ask_more"}:
+        return Intent("ask_more")
+    if normalized in {"جمع‌بندی کوتاه", "summary"} or _has_any({"خلاصه", "جمع بندی"}):
+        return Intent("summary")
+    if normalized in {"سکه‌هام", "balance"} or _has_any({"کیف پول", "سکه", "balance", "wallet"}):
+        return Intent("wallet_status")
+    if _has_any({"تراکنش", "پرداخت", "خرید"}) and not normalized.startswith("pack:"):
+        return Intent("txn_history")
+    if normalized.startswith("pack:"):
+        return Intent("pack_select", {"code": normalized.split(":", 1)[1]})
+    if normalized in {"تنظیمات", "settings"} or _has_any({"تنظیم", "ترجیح"}):
+        return Intent("settings")
+    if normalized in {"خرید سکه", "buy_coins", "packs"}:
+        return Intent("pack_list")
+    if normalized in {"دستورات", "commands", "منو", "menu"} or _has_any({"منو", "دستور"}):
+        return Intent("command_menu")
+    if _has_any({"پروفایل ربات", "هویت ربات", "identity", "persona"}):
+        return Intent("bot_profile")
+    return Intent("chat")
 
 
 def _get_default_bot() -> Bot | None:
@@ -89,6 +134,12 @@ def _ensure_conversation(user: User, bot: Bot | None) -> Conversation | None:
     return conversation
 
 
+def _format_ts(dt: datetime | None) -> str:
+    if not dt:
+        return "نامشخص"
+    return dt.astimezone(timezone.get_current_timezone()).strftime("%Y-%m-%d %H:%M")
+
+
 def _reply_payload(text: str, keyboard: list[list[dict[str, str]]] | None = None, parse_mode: str | None = None):
     payload: dict[str, Any] = {"text": text}
     if keyboard:
@@ -101,6 +152,64 @@ def _reply_payload(text: str, keyboard: list[list[dict[str, str]]] | None = None
 def _last_user_message_text(conversation: Conversation) -> str:
     last_user = conversation.messages.filter(role=Message.Role.USER).order_by("-seq").first()
     return (last_user.text or "").strip() if last_user else ""
+
+
+def _wallet_snapshot_reply(user: User) -> dict[str, Any]:
+    wallet = ensure_wallet(user)
+    last_txn = user.coin_txns.order_by("-created_at").first()
+    if last_txn:
+        sign = "+" if last_txn.delta > 0 else "-"
+        txn_line = f"آخرین تراکنش: {sign}{abs(last_txn.delta)} ({last_txn.get_reason_display()}) در {_format_ts(last_txn.created_at)}."
+    else:
+        txn_line = "تراکنشی ثبت نشده."
+    return _reply_payload(f"کیف پول: {wallet.balance} سکه.\n{txn_line}")
+
+
+def _txn_history_replies(user: User) -> list[dict[str, Any]]:
+    txns = list(user.coin_txns.order_by("-created_at")[:5])
+    if not txns:
+        return [_reply_payload("هیچ تراکنشی پیدا نشد.")]
+
+    lines = []
+    for txn in txns:
+        sign = "+" if txn.delta > 0 else "-"
+        lines.append(f"{_format_ts(txn.created_at)} | {txn.get_reason_display()} | {sign}{abs(txn.delta)} | موجودی پس از آن: {txn.balance_after or 'نامشخص'}")
+    body = "آخرین تراکنش‌ها:\n" + "\n".join(lines)
+    return [_reply_payload(body)]
+
+
+def _bot_profile_replies(bot: Bot, user: User) -> list[dict[str, Any]]:
+    identity: BotIdentity | None = getattr(bot, "identity", None)
+    state = BotUserState.objects.filter(bot=bot, user=user).first()
+    tone = identity.core_tone if identity else "نامشخص"
+    background = identity.background_seed if identity else "نامشخص"
+    familiarity = f"{state.familiarity:.2f}" if state else "0.00"
+    trust = f"{state.trust:.2f}" if state else "0.00"
+    verbosity = f"{state.user_pref_verbosity:.2f}" if state else "0.00"
+    questions = f"{state.user_pref_questions:.2f}" if state else "0.00"
+    lines = [
+        f"بات: {bot.display_name} ({bot.code})",
+        f"هویت پایه: لحن={tone} / پس‌زمینه={background}",
+        f"آشنایی/اعتماد: {familiarity} / {trust}",
+        f"ترجیحات پاسخ: verbosity={verbosity} / questions={questions}",
+    ]
+    return [_reply_payload("\n".join(lines))]
+
+
+def _command_menu_replies(conversation: Conversation, user: User) -> list[dict[str, Any]]:
+    wallet = ensure_wallet(user)
+    keyboard = [
+        [{"text": "💰 کیف پول", "callback_data": "wallet"}],
+        [{"text": "🧾 تراکنش‌ها", "callback_data": "txns"}],
+        [{"text": "🧠 خلاصه گفتگو", "callback_data": "summary"}],
+        [{"text": "🪪 پروفایل ربات", "callback_data": "bot_profile"}],
+        [{"text": "⚙️ تنظیمات", "callback_data": "settings"}],
+    ]
+    hint = (
+        f"موجودی فعلی: {wallet.balance} سکه. "
+        "از منو می‌تونی وضعیت کیف پول، تراکنش‌ها، خلاصه گفتگو و هویت ربات رو ببینی."
+    )
+    return [_reply_payload(hint, keyboard=keyboard)]
 
 
 def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_user_text: str):
@@ -123,6 +232,14 @@ def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_u
                 {"text": "یه کم درباره‌اش بگو", "callback_data": "about"},
             ]
         )
+
+    keyboard.append(
+        [
+            {"text": "دستورات", "callback_data": "commands"},
+            {"text": "کیف پول", "callback_data": "wallet"},
+        ]
+    )
+    keyboard.append([{"text": "🧾 تراکنش‌ها", "callback_data": "txns"}, {"text": "⚙️ تنظیمات", "callback_data": "settings"}])
 
     if is_closing and has_history:
         keyboard.append([{"text": "جمع‌بندی کوتاه", "callback_data": "summary"}])
@@ -212,11 +329,6 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
     )
     _refresh_memory_summary(conversation)
     return msg
-
-
-def _balance_reply(user: User):
-    wallet = ensure_wallet(user)
-    return _reply_payload(f"سکه فعلی: {wallet.balance}")
 
 
 def _coin_pack_buttons():
@@ -315,55 +427,100 @@ def _split_reply(text: str, limit: int) -> list[str]:
     return [first, rest]
 
 
-def _persona_style_instructions(state: BotUserState | None, bot: Bot) -> str:
-    if not state:
+def _decide_conversation_mode(normalized_user_text: str) -> tuple[str, str]:
+    text = normalized_user_text.strip()
+    if not text:
+        return "idle", "پیام خالی یا فقط فاصله بود"
+
+    has_question_mark = "?" in text or "؟" in text
+    closing_keywords = {"مرسی", "ممنون", "خدافظ", "خداحافظ", "فعلاً", "بای"}
+    guide_keywords = {"راهنما", "گزینه", "چه کاری میشه کرد", "قابلیت"}
+    if any(k in text for k in closing_keywords):
+        return "answer", "سیگنال پایان یا تشکر"
+    if any(k in text for k in guide_keywords):
+        return "guide", "درخواست راهنمایی یا گزینه‌ها"
+
+    tokens = text.split()
+    if len(tokens) <= 3 and not has_question_mark:
+        return "clarify", "پیام کوتاه و مبهم"
+    if has_question_mark:
+        return "answer", "سؤال مستقیم"
+    return "answer", "پاسخ مستقیم بدون نیاز به سؤال"
+
+
+def _mode_instruction(mode: str) -> str:
+    if mode == "answer":
+        return "mode=answer: فقط پاسخ بده، هیچ سؤالی نپرس و پیشنهاد را خبری بیان کن."
+    if mode == "clarify":
+        return "mode=clarify: اگر واقعاً نیاز بود فقط یک سؤال خیلی کوتاه بپرس؛ در غیر این صورت پاسخ مستقیم بده."
+    if mode == "guide":
+        return "mode=guide: یک گزینه یا قدم بعدی خبری پیشنهاد بده و حداکثر یک سؤال کوتاه مجاز است."
+    return "mode=idle: پاسخ بسیار کوتاه و بدون سؤال."
+
+
+def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
+    if not state and not identity:
         return (
             "کوتاه و دوستانه جواب بده؛ اگر question_budget=0 بود سؤال نپرس؛ "
             "از نصیحت یا لحن درمانی دوری کن."
         )
 
-    def _bucket(value: float, low: float, mid: float):
-        if value <= low:
-            return "low"
-        if value <= mid:
-            return "mid"
-        return "high"
+    pieces: list[str] = []
 
-    verbosity_level = _bucket(state.user_pref_verbosity, 0.2, 0.65)
-    if verbosity_level == "low":
-        length_rule = "خیلی کوتاه و مستقیم باش."
-    elif verbosity_level == "mid":
-        length_rule = "کوتاه بمان اما اگر لازم بود یک توضیح کوتاه اضافه کن."
-    else:
-        length_rule = "مختصر بمان اما یک خط اضافه برای روشن کردن موضوع مجاز است."
+    if identity:
+        tone_map = {
+            "QUIET": "لحن بسیار کوتاه و کم‌حرف؛ اغراق نکن.",
+            "PLAIN": "لحن ساده و بی‌حاشیه؛ از صمیمیت اضافی دوری کن.",
+            "WARM": "لحن گرم اما مختصر؛ صمیمیت کنترل‌شده.",
+            "DRY": "لحن خشک اما محترمانه؛ از شوخی و احساسات اضافی پرهیز کن.",
+        }
+        pieces.append(tone_map.get(identity.core_tone, "لحن ساده و محترمانه نگه دار."))
+        pieces.append(f"پس‌زمینه هویت: {identity.background_seed} (به عنوان لحن، نه داستان).")
 
-    questions_level = _bucket(state.user_pref_questions, 0.2, 0.6)
-    if questions_level == "low":
-        max_questions = 0
-        questions_rule = "سؤال نپرس مگر کاربر خودش درخواست کند یا ابهام جدی باشد و question_budget اجازه بدهد."
-    elif questions_level == "mid":
-        max_questions = min(1, bot.max_questions_per_reply)
-        questions_rule = (
-            "در هر جواب حداکثر یک سؤال بپرس و فقط وقتی به ادامه گفتگو کمک می‌کند و question_budget=1 است."
-        )
-    else:
-        max_questions = min(2, bot.max_questions_per_reply)
-        questions_rule = (
-            f"در هر جواب حداکثر {max_questions} سؤال کوتاه و مشخص بپرس، فقط وقتی question_budget=1 و واقعاً ابهام داری."
-        )
+        talk_scale = identity.talkativeness
+        if talk_scale < 0.25:
+            pieces.append("خروجی را به یک پاراگراف کوتاه (حداکثر ۲ جمله) محدود کن.")
+        elif talk_scale < 0.55:
+            pieces.append("خروجی را مختصر نگه دار و اگر لازم بود یک جمله توضیح اضافه کن.")
+        else:
+            pieces.append("اگر نکته مهمی وجود دارد، نهایتاً سه جمله بنویس اما هنوز فشرده بمان.")
 
-    closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
-    if closeness_score < 0.2:
-        tone_rule = "لحن خنثی و محترمانه نگه دار؛ صمیمی نشو."
-    elif closeness_score < 0.5:
-        tone_rule = "دوستانه و مختصر باش؛ صمیمیت ملایم کافی است."
-    else:
-        tone_rule = "صمیمی و گرم باش اما اغراق نکن."
+    if state:
+        def _bucket(value: float, low: float, mid: float):
+            if value <= low:
+                return "low"
+            if value <= mid:
+                return "mid"
+            return "high"
 
-    return (
-        f"{length_rule} {tone_rule} {questions_rule} "
-        "نصیحت یا لحن درمانی نداشته باش و اگر کاربر سکوت کرد، اصرار نکن."
-    )
+        verbosity_level = _bucket(state.user_pref_verbosity, 0.2, 0.65)
+        if verbosity_level == "low":
+            pieces.append("verbosity=low → حداکثر دو جمله کوتاه.")
+        elif verbosity_level == "mid":
+            pieces.append("verbosity=mid → یک پاراگراف خیلی کوتاه با حداکثر سه جمله.")
+        else:
+            pieces.append("verbosity=high → می‌توانی سه جمله فشرده و بدون تکرار بنویسی.")
+
+        questions_level = _bucket(state.user_pref_questions, 0.2, 0.6)
+        if questions_level == "low":
+            pieces.append("questions=none → سؤال نپرس مگر کاربر خواسته باشد.")
+        elif questions_level == "mid":
+            pieces.append("questions=mid → حداکثر یک سؤال کوتاه اگر ابهام حیاتی است.")
+        else:
+            pieces.append("questions=high → حداکثر دو سؤال مشخص، فقط اگر question_budget اجازه داد.")
+
+        closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
+        if closeness_score < 0.2:
+            pieces.append("اعتماد پایین است؛ لحن رسمی و بدون فرضیات.")
+        elif closeness_score < 0.5:
+            pieces.append("اعتماد متوسط؛ دوستانه اما محتاط.")
+        else:
+            pieces.append("اعتماد بالا؛ می‌توانی کمی صمیمی‌تر باشی اما از نصیحت دوری کن.")
+
+        if state.style_rules:
+            pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
+
+    return " ".join(pieces)
 
 
 def _question_budget_decision(normalized_user_text: str) -> tuple[int, str]:
@@ -390,6 +547,18 @@ def _question_budget_decision(normalized_user_text: str) -> tuple[int, str]:
         return 1, "جمله خیلی کوتاه و بدون پرسش است"
 
     return 0, "درخواست برای پاسخ کافی است"
+
+
+def _enforce_mode_on_budget(mode: str, question_budget: int, budget_reason: str, mode_reason: str) -> tuple[int, str]:
+    if mode == "answer":
+        return 0, f"mode=answer: سؤال ممنوع. {mode_reason}"
+    if mode == "clarify":
+        return 1, f"mode=clarify: فقط یک سؤال مجاز است. {mode_reason}"
+    if mode == "guide":
+        return min(1, question_budget), f"mode=guide: یک سؤال یا گزینه کوتاه مجاز است. {budget_reason}"
+    if mode == "idle":
+        return 0, f"mode=idle: فقط یک پاسخ خیلی کوتاه بدون سؤال. {mode_reason}"
+    return question_budget, budget_reason
 
 
 def _question_policy_instructions(question_budget: int, budget_reason: str) -> str:
@@ -457,9 +626,12 @@ def _build_llm_messages(
     bot: Bot,
     conversation: Conversation,
     state: BotUserState | None,
+    identity: BotIdentity | None,
     normalized_user_text: str,
     question_budget: int,
     budget_reason: str,
+    mode: str,
+    mode_reason: str,
 ):
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
@@ -467,12 +639,15 @@ def _build_llm_messages(
         or "تو یک همراه گفت‌وگوی مهربان هستی. پاسخ‌ها را به فارسی و ساده بنویس؛ ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
         "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد."
     )
-    persona_rules = _persona_style_instructions(state, bot)
+    persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
+    mode_hint = _mode_instruction(mode)
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": persona_rules},
         {"role": "system", "content": policy_hint},
+        {"role": "system", "content": mode_hint},
+        {"role": "system", "content": f"توضیح حالت: {mode_reason}"},
     ]
     template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
     messages.append({"role": "system", "content": template_hint})
@@ -497,14 +672,20 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
+    mode, mode_reason = _decide_conversation_mode(normalized_user_text)
     question_budget, budget_reason = _question_budget_decision(normalized_user_text)
+    question_budget, budget_reason = _enforce_mode_on_budget(mode, question_budget, budget_reason, mode_reason)
+    identity = getattr(bot, "identity", None)
     prompt_messages = _build_llm_messages(
         bot,
         conversation,
         state,
+        identity,
         normalized_user_text,
         question_budget,
         budget_reason,
+        mode,
+        mode_reason,
     )
     log = LLMCallLog.objects.create(
         conversation=conversation,
@@ -515,6 +696,8 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
             "message_count": len(prompt_messages),
             "question_budget": question_budget,
             "budget_reason": budget_reason,
+            "mode": mode,
+            "mode_reason": mode_reason,
         },
     )
     started = time.monotonic()
@@ -585,30 +768,23 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
 
     message_meta = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
     normalized = (text or "").strip()
-    if normalized in {"/start", "start"}:
+    intent = _detect_intent(normalized)
+    if intent.kind == "start":
         return _start_replies(user, conversation)
-    if normalized in {"شروع کنیم", "start_now"}:
+    if intent.kind == "start_now":
         _record_user_message(conversation, text, message_meta)
         return [_reply_payload("هرچی هست همین‌جا بگو.")]
-    if normalized in {"یه کم درباره‌اش بگو", "about"}:
+    if intent.kind == "about":
         return _about_replies()
-    if normalized in {"یه سؤال دقیق‌تر بپرس", "ask_more"}:
+    if intent.kind == "ask_more":
         return [_reply_payload("کدوم بخشش برات مبهمه؟ یک جمله بگو تا دقیق‌تر پاسخ بدم.")]
-    if normalized in {"جمع‌بندی کوتاه", "summary"}:
-        summary = (conversation.memory_summary or "").strip()
-        text_summary = summary if summary else "خلاصه‌ای آماده نیست. هر نکته‌ای که می‌خوای مرور کنیم رو بگو."
-        return [_reply_payload(text_summary)]
-    if normalized in {"سکه‌هام", "balance"}:
-        return [_balance_reply(user)]
-    if normalized in {"تنظیمات", "settings"}:
-        return [_settings_reply()]
-    if normalized in {"خرید سکه", "buy_coins", "packs"}:
+    if intent.kind == "pack_list":
         pack_buttons = _coin_pack_buttons()
         if pack_buttons:
             return [_reply_payload("یک بسته انتخاب کن:", keyboard=pack_buttons)]
         return [_reply_payload("بسته‌ای تعریف نشده.")]
-    if normalized.startswith("pack:"):
-        code = normalized.split(":", 1)[1]
+    if intent.kind == "pack_select":
+        code = intent.data.get("code", "")
         try:
             pack = CoinPack.objects.get(code=code, is_active=True)
         except CoinPack.DoesNotExist:
@@ -620,6 +796,26 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
             _reply_payload(f"برای {pack.coins} سکه، این لینکه:\n{pay_link}"),
             _reply_payload("بعد از پرداخت، سکه‌ها اضافه می‌شن. هر وقت خواستی ادامه بده."),
         ]
+    if intent.kind == "summary":
+        summary = (conversation.memory_summary or "").strip()
+        text_summary = summary if summary else "خلاصه‌ای آماده نیست. هر نکته‌ای که می‌خوای مرور کنیم رو بگو."
+        _record_user_message(conversation, text, message_meta)
+        return [_reply_payload(text_summary)]
+    if intent.kind == "settings":
+        _record_user_message(conversation, text, message_meta)
+        return [_settings_reply()]
+    if intent.kind == "command_menu":
+        _record_user_message(conversation, text, message_meta)
+        return _command_menu_replies(conversation, user)
+    if intent.kind == "wallet_status":
+        _record_user_message(conversation, text, message_meta)
+        return [_wallet_snapshot_reply(user)]
+    if intent.kind == "txn_history":
+        _record_user_message(conversation, text, message_meta)
+        return _txn_history_replies(user)
+    if intent.kind == "bot_profile":
+        _record_user_message(conversation, text, message_meta)
+        return _bot_profile_replies(bot, user)
 
     # Regular chat flow
     _record_user_message(conversation, text, message_meta)
