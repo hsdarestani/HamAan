@@ -94,6 +94,10 @@ class BotIdentity(TimeStampedModel):
         help_text="Higher means more mistakes/ambiguity in recall hints.",
     )
 
+    # Compact, structured identity profile (DB-backed; never config-only)
+    # Example: {"values": ["کنجکاوی"], "dreams": ["دیدن شمال"], "favorites": ["هوای بارونی"]}
+    identity_profile = models.JSONField(default=dict, blank=True)
+
     # Constraints baked into persona
     avoids_advice = models.BooleanField(default=True)
     avoids_therapy_tone = models.BooleanField(default=True)
@@ -143,6 +147,10 @@ class BotUserState(TimeStampedModel):
     # Compact per-user "soft rules" discovered (internal-only)
     # Example: {"dont_use":["کاملاً می‌فهمم"], "max_questions":1, "reply_length":"short"}
     style_rules = models.JSONField(default=dict, blank=True)
+
+    # Structured, per-user relationship memory (DB-backed)
+    # Example: {"shared_topics": ["دوچرخه"], "nicknames": ["رفیق"], "recent_feelings": ["آروم"]}
+    relationship_memory = models.JSONField(default=dict, blank=True)
 
     # Whether user allows initiation for THIS bot (can differ from global user setting)
     initiation_opt_in = models.BooleanField(default=True, db_index=True)
@@ -248,4 +256,3 @@ class PromptSnippet(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"PromptSnippet({self.key}@v{self.version})"
-
