@@ -9,6 +9,7 @@ from django.views.decorators.http import require_http_methods
 
 from automation.models import InitiationEvent, InitiationRule
 from persona.models import Bot, BotIdentity, BotUserState, MemoryFragment
+from persona.relationship import update_relationship_memory
 from safety.models import BlockedPhrase, SafetyEvent, UserRestriction
 from users.models import User, UserPrefs
 from .models import Conversation, LLMCallLog, Message, next_message_seq
@@ -130,6 +131,15 @@ def _upsert_memory_fragment(state, text, now, source_ref):
             times_reinforced=F("times_reinforced") + 1,
             source_ref=str(source_ref),
         )
+
+
+def _recent_user_texts(conversation: Conversation, limit: int = 20) -> list[str]:
+    user_messages = (
+        conversation.messages.filter(role=Message.Role.USER)
+        .order_by("-seq")
+        .values_list("text", flat=True)[:limit]
+    )
+    return [text for text in user_messages if text]
 
 
 @csrf_exempt
@@ -257,6 +267,7 @@ def _create_message(conversation, role, text, telegram_ids=None):
 
     # Seed or reinforce lightweight memory fragments from the interaction
     _upsert_memory_fragment(state, text, now, source_ref=message.id)
+    update_relationship_memory(state, _recent_user_texts(conversation), latest_text=text, now=now)
 
     updates = {"last_activity_at": now, "updated_at": now}
     if role == Message.Role.USER:
