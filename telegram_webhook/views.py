@@ -98,23 +98,66 @@ def _reply_payload(text: str, keyboard: list[list[dict[str, str]]] | None = None
     return payload
 
 
-def _start_replies():
-    keyboard = [
-        [
-            {"text": "شروع کنیم", "callback_data": "start_now"},
-            {"text": "یه کم درباره‌اش بگو", "callback_data": "about"},
-        ],
-        [
-            {"text": "سکه‌هام", "callback_data": "balance"},
-            {"text": "خرید سکه", "callback_data": "buy_coins"},
-        ],
-        [{"text": "تنظیمات", "callback_data": "settings"}],
-    ]
-    return [
-        _reply_payload("سلام. من اینجام که حرف بزنی. نه نصیحت می‌کنم، نه سؤال‌پیچت می‌کنم."),
-        _reply_payload("اگه دوست داری همین الان هرچی تو ذهنته بنویس.\nاگه هم حوصله نداری، می‌تونیم فقط چند دقیقه سکوت کنیم."),
-        _reply_payload("چند پیام اول مهمون من. بعدش برای هر جواب، یه سکه کم می‌شه. هر وقت نخواستی، قطعش کن.", keyboard=keyboard),
-    ]
+def _last_user_message_text(conversation: Conversation) -> str:
+    last_user = conversation.messages.filter(role=Message.Role.USER).order_by("-seq").first()
+    return (last_user.text or "").strip() if last_user else ""
+
+
+def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_user_text: str):
+    has_history = conversation.messages.exists()
+    keyboard: list[list[dict[str, str]]] = []
+    is_question = "?" in last_user_text or "؟" in last_user_text
+    closing_keywords = {"مرسی", "ممنون", "خدافظ", "خداحافظ", "فعلاً", "بای"}
+    is_closing = any(k in last_user_text for k in closing_keywords)
+    is_low_balance = wallet_balance <= 2
+
+    if has_history:
+        row = [{"text": "ادامه بدیم", "callback_data": "start_now"}]
+        if is_question:
+            row.append({"text": "یه سؤال دقیق‌تر بپرس", "callback_data": "ask_more"})
+        keyboard.append(row)
+    else:
+        keyboard.append(
+            [
+                {"text": "شروع کنیم", "callback_data": "start_now"},
+                {"text": "یه کم درباره‌اش بگو", "callback_data": "about"},
+            ]
+        )
+
+    if is_closing and has_history:
+        keyboard.append([{"text": "جمع‌بندی کوتاه", "callback_data": "summary"}])
+
+    if is_low_balance:
+        keyboard.append([{"text": "خرید سکه", "callback_data": "buy_coins"}])
+    elif wallet_balance > 0 and not is_closing and not is_question:
+        keyboard.append([{"text": "سکه‌هام", "callback_data": "balance"}])
+
+    return keyboard
+
+
+def _start_replies(user: User, conversation: Conversation):
+    wallet = ensure_wallet(user)
+    has_history = conversation.messages.exists()
+    last_user_text = _last_user_message_text(conversation)
+    keyboard = _contextual_keyboard(conversation, wallet.balance, last_user_text)
+
+    if has_history:
+        welcome = "سلام دوباره. از همین‌جا می‌تونیم ادامه بدیم؛ جواب‌هام کوتاهه و بی‌نصیحت."
+    else:
+        welcome = "سلام. اینجا می‌تونی راحت حرف بزنی؛ جواب‌هام کوتاهه و گیر نمی‌دم."
+
+    if wallet.balance <= 0:
+        coin_hint = "چند پیام اول مهمون من، ولی الان سکه‌ات تموم شده."
+        question = "می‌خوای شروع کنیم یا اول سکه بگیری؟"
+    elif has_history:
+        coin_hint = "هر جواب یه سکه کم می‌شه؛ هر وقت خواستی قطعش می‌کنیم."
+        question = "می‌خوای ادامه بدیم یا اول تنظیمات/سکه‌ها رو ببینی؟"
+    else:
+        coin_hint = "چند پیام اول مهمون من؛ بعد هر جواب یه سکه کم می‌شه."
+        question = "شروع کنیم یا اول یه توضیح کوتاه بدم؟"
+
+    text = f"{welcome}\n{coin_hint}\n{question}"
+    return [_reply_payload(text, keyboard=keyboard)]
 
 
 def _about_replies():
@@ -149,6 +192,7 @@ def _record_bot_message(
     Conversation.objects.filter(id=conversation.id).update(
         last_activity_at=now, last_bot_reply_at=now, has_unread_bot_message=True, updated_at=now
     )
+    _refresh_memory_summary(conversation)
     return msg
 
 
@@ -166,6 +210,7 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
     Conversation.objects.filter(id=conversation.id).update(
         last_activity_at=now, last_user_message_at=now, has_unread_bot_message=False, updated_at=now
     )
+    _refresh_memory_summary(conversation)
     return msg
 
 
@@ -209,20 +254,157 @@ def _settings_reply():
     return _reply_payload("تنظیمات ساده:\n- کم‌حرف‌تر باش\n- یه کم بیشتر بپرس\n- ربات گاهی سر بزنه / نزنه\n- پاک کردن داده‌ها (اختیاری)")
 
 
-def _recent_messages(conversation: Conversation, limit: int = 10):
+def _recent_messages(conversation: Conversation, limit: int = 30):
     history = list(conversation.messages.order_by("-seq")[:limit])
     history.reverse()
     return history
 
 
-def _build_llm_messages(bot: Bot, conversation: Conversation):
+def _refresh_memory_summary(conversation: Conversation, *, max_chars: int = 900, window: int = 40):
+    recent_messages = list(conversation.messages.order_by("-seq")[:window])
+    recent_messages.reverse()
+    lines: list[str] = []
+    for msg in recent_messages:
+        snippet = (msg.text or "").strip().replace("\n", " ")
+        if not snippet:
+            continue
+        snippet = snippet[:160]
+        if msg.role == Message.Role.USER:
+            prefix = "کاربر"
+        elif msg.role == Message.Role.BOT:
+            prefix = "ربات"
+        else:
+            prefix = "سیستم"
+        lines.append(f"{prefix}: {snippet}")
+
+    recent_block = " | ".join(lines[-20:])
+    prior = (conversation.memory_summary or "").strip()
+    parts = [prior] if prior else []
+    if recent_block:
+        parts.append(f"گفت‌وگوهای اخیر: {recent_block}")
+
+    new_summary = " / ".join(parts).strip()
+    if len(new_summary) > max_chars:
+        new_summary = new_summary[:max_chars]
+
+    Conversation.objects.filter(id=conversation.id).update(memory_summary=new_summary, updated_at=timezone.now())
+    conversation.memory_summary = new_summary
+
+
+def _typing_delay(text: str) -> float:
+    # Roughly model human typing rhythm; clamp to avoid long sleeps.
+    base = 0.4
+    per_char = 0.012
+    delay = base + len(text) * per_char
+    return max(0.35, min(delay, 2.2))
+
+
+def _split_reply(text: str, limit: int) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    split_points = [text.rfind(sep, 0, limit) for sep in [". ", "؟", "!", "\n"]]
+    best = max(split_points)
+    if best <= 0:
+        best = limit
+
+    first = text[:best].strip()
+    rest = text[best:].strip()
+    if not rest:
+        return [first]
+    return [first, rest]
+
+
+def _persona_style_instructions(state: BotUserState | None, bot: Bot) -> str:
+    if not state:
+        return (
+            "کوتاه و دوستانه جواب بده؛ بیش از یک سؤال نپرس مگر کاربر خواست؛ "
+            "از نصیحت یا لحن درمانی دوری کن."
+        )
+
+    def _bucket(value: float, low: float, mid: float):
+        if value <= low:
+            return "low"
+        if value <= mid:
+            return "mid"
+        return "high"
+
+    verbosity_level = _bucket(state.user_pref_verbosity, 0.2, 0.65)
+    if verbosity_level == "low":
+        length_rule = "خیلی کوتاه و مستقیم باش."
+    elif verbosity_level == "mid":
+        length_rule = "کوتاه بمان اما اگر لازم بود یک توضیح کوتاه اضافه کن."
+    else:
+        length_rule = "مختصر بمان اما یک خط اضافه برای روشن کردن موضوع مجاز است."
+
+    questions_level = _bucket(state.user_pref_questions, 0.2, 0.6)
+    if questions_level == "low":
+        max_questions = 0
+        questions_rule = "سؤال نپرس مگر کاربر خودش درخواست کند."
+    elif questions_level == "mid":
+        max_questions = min(1, bot.max_questions_per_reply)
+        questions_rule = "در هر جواب حداکثر یک سؤال بپرس و فقط وقتی به ادامه گفتگو کمک می‌کند."
+    else:
+        max_questions = min(2, bot.max_questions_per_reply)
+        questions_rule = (
+            f"در هر جواب حداکثر {max_questions} سؤال کوتاه بپرس و از پرسیدن بیشتر خودداری کن."
+        )
+
+    closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
+    if closeness_score < 0.2:
+        tone_rule = "لحن خنثی و محترمانه نگه دار؛ صمیمی نشو."
+    elif closeness_score < 0.5:
+        tone_rule = "دوستانه و مختصر باش؛ صمیمیت ملایم کافی است."
+    else:
+        tone_rule = "صمیمی و گرم باش اما اغراق نکن."
+
+    return (
+        f"{length_rule} {tone_rule} {questions_rule} "
+        "نصیحت یا لحن درمانی نداشته باش و اگر کاربر سکوت کرد، اصرار نکن."
+    )
+
+
+def _response_template_hint(normalized_user_text: str, conversation: Conversation) -> str:
+    text = normalized_user_text
+    lower = text.lower()
+    is_question = "?" in text or "؟" in text
+    closing_keywords = {"مرسی", "ممنون", "خدافظ", "خداحافظ", "فعلاً", "بای"}
+    has_closing = any(k in text for k in closing_keywords)
+    short_length = len(text) < 20
+    feeling_keywords = {"خسته", "بی‌حال", "دلگیر", "نگران", "ناراحت", "غمگین"}
+    is_feeling = any(k in text for k in feeling_keywords)
+    long_chat = conversation.messages.count() >= 8
+
+    if has_closing:
+        template = "جمع‌بندی: دو نکته مهم را یادآوری کن، یک خداحافظی محترمانه یا پیشنهاد ادامه در آینده."
+    elif is_feeling and not is_question:
+        template = "همدلی: یک جمله همدلانه و بازتاب احساس، یک یادآوری کوتاه که گوش می‌دهی، و فقط در صورت تمایل کاربر یک سؤال نرم."
+    elif is_question:
+        template = "راهنمایی/اطلاعاتی: بازتاب کوتاه، پاسخ روشن و کاربردی، و اگر لازم بود یک قدم بعدی یا سؤال دقیق."
+    elif long_chat and not short_length:
+        template = "پیگیری: یادآوری کوتاه موضوع قبلی، یک سؤال مشخص برای ادامه، و یک پیشنهاد کوچک."
+    else:
+        template = "اطلاعاتی: بازتاب کوتاه، پاسخ مستقیم، و یک سؤال دقیق فقط اگر کمک می‌کند."
+
+    return f"الگوی پاسخ پیشنهادی ({template})"
+
+
+def _build_llm_messages(bot: Bot, conversation: Conversation, state: BotUserState | None, normalized_user_text: str):
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
         base_prompt
-        or "تو یک همراه گفت‌وگوی کوتاه و مهربان هستی. با لحن ساده و دوستانه پاسخ بده، کوتاه و بدون نصیحت یا پرسش‌های زیاد. "
-        "اگر کاربر خواست، فقط شنونده باش و بیشتر از یک سؤال در هر پاسخ نپرس. پاسخ‌ها را به فارسی بنویس."
+        or "تو یک همراه گفت‌وگوی مهربان هستی. در هر پاسخ سه گام داشته باش: "
+        "۱) یک جمله کوتاه که حرف یا حال کاربر را بازتاب دهد؛ ۲) یک جواب روشن و مشخص بده؛ "
+        "۳) فقط اگر واقعاً لازم است یک سؤال دقیق برای ادامه بپرس. پاسخ‌ها را به فارسی و ساده بنویس."
     )
+    persona_rules = _persona_style_instructions(state, bot)
+    system_prompt = f"{system_prompt}\n{persona_rules}"
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    template_hint = _response_template_hint(normalized_user_text, conversation)
+    messages.append({"role": "system", "content": template_hint})
+    summary = (conversation.memory_summary or "").strip()
+    if summary:
+        messages.append({"role": "system", "content": f"خلاصه گفت‌وگو تا اینجا: {summary}"})
     for msg in _recent_messages(conversation):
         if msg.role == Message.Role.USER:
             role = "user"
@@ -234,13 +416,14 @@ def _build_llm_messages(bot: Bot, conversation: Conversation):
     return messages
 
 
-def _generate_ai_reply(conversation: Conversation, bot: Bot) -> dict[str, Any] | None:
+def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
     if not os.getenv("OPENAI_API_KEY"):
         logger.warning("telegram_webhook: missing OPENAI_API_KEY")
         return None
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    prompt_messages = _build_llm_messages(bot, conversation)
+    state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
+    prompt_messages = _build_llm_messages(bot, conversation, state, normalized_user_text)
     log = LLMCallLog.objects.create(
         conversation=conversation,
         provider=LLMCallLog.Provider.OPENAI,
@@ -250,11 +433,12 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot) -> dict[str, Any] |
     )
     started = time.monotonic()
     try:
+        max_tokens = min(768, bot.max_output_chars * 3)
         response = openai_client.chat.completions.create(
             model=model,
             messages=prompt_messages,
             temperature=0.6,
-            max_tokens=min(256, bot.max_output_chars * 2),
+            max_tokens=max_tokens,
         )
         latency_ms = int((time.monotonic() - started) * 1000)
         usage = getattr(response, "usage", None)
@@ -285,6 +469,8 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot) -> dict[str, Any] |
 def _send_replies(chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None) -> bool:
     success = True
     for reply in replies:
+        _telegram_request("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+        time.sleep(_typing_delay(reply.get("text", "")))
         payload = {"chat_id": chat_id, "text": reply["text"]}
         if reply_to_message_id:
             payload["reply_to_message_id"] = reply_to_message_id
@@ -312,12 +498,18 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
     message_meta = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
     normalized = (text or "").strip()
     if normalized in {"/start", "start"}:
-        return _start_replies()
+        return _start_replies(user, conversation)
     if normalized in {"شروع کنیم", "start_now"}:
         _record_user_message(conversation, text, message_meta)
         return [_reply_payload("هرچی هست همین‌جا بگو.")]
     if normalized in {"یه کم درباره‌اش بگو", "about"}:
         return _about_replies()
+    if normalized in {"یه سؤال دقیق‌تر بپرس", "ask_more"}:
+        return [_reply_payload("کدوم بخشش برات مبهمه؟ یک جمله بگو تا دقیق‌تر پاسخ بدم.")]
+    if normalized in {"جمع‌بندی کوتاه", "summary"}:
+        summary = (conversation.memory_summary or "").strip()
+        text_summary = summary if summary else "خلاصه‌ای آماده نیست. هر نکته‌ای که می‌خوای مرور کنیم رو بگو."
+        return [_reply_payload(text_summary)]
     if normalized in {"سکه‌هام", "balance"}:
         return [_balance_reply(user)]
     if normalized in {"تنظیمات", "settings"}:
@@ -347,17 +539,27 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
     if wallet.balance <= 0:
         return _paywall_replies()
 
-    generation = _generate_ai_reply(conversation, bot)
+    generation = _generate_ai_reply(conversation, bot, normalized)
     if not generation:
         bot_reply = _record_bot_message(conversation, "فعلاً نمی‌تونم جواب بدم. کمی بعد دوباره امتحان کن.")
         return [_reply_payload(bot_reply.text)]
 
+    reply_limit = max(bot.max_output_chars, 500)
+    parts = _split_reply(generation["text"], reply_limit)
+    replies = []
+
     bot_reply = _record_bot_message(
         conversation,
-        generation["text"],
+        parts[0],
         token_in=generation["token_in"],
         token_out=generation["token_out"],
     )
+    replies.append(_reply_payload(parts[0]))
+
+    for extra in parts[1:]:
+        _record_bot_message(conversation, extra)
+        replies.append(_reply_payload(extra))
+
     try:
         apply_coin_txn(
             user=user,
@@ -369,7 +571,7 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
     except Exception as exc:  # noqa: BLE001
         logger.exception("telegram_webhook: coin debit failed user=%s conv=%s error=%s", user.id, conversation.id, exc)
         return _paywall_replies()
-    return [_reply_payload(bot_reply.text)]
+    return replies
 
 
 def _extract_text(payload: dict[str, Any]) -> str:

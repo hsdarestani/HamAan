@@ -59,6 +59,8 @@ class Conversation(TimeStampedModel):
 
     # Optional: last few topic tags (MVP)
     topic_hint = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    # Rolling short summary to preserve long context without full history
+    memory_summary = models.TextField(blank=True, default="")
 
     class Meta:
         db_table = "chat_conversation"
@@ -233,4 +235,3 @@ def next_message_seq(conversation_id: uuid.UUID) -> int:
         .first()
     )
     return (last or 0) + 1
-
