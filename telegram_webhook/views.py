@@ -8,6 +8,7 @@ from datetime import datetime
 import requests
 from openai import OpenAI
 
+from django.db.models import F
 from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -15,7 +16,7 @@ from django.views.decorators.http import require_http_methods
 
 from billing.models import CoinPack, CoinTxn, Purchase, apply_coin_txn, ensure_wallet
 from chat.models import Conversation, LLMCallLog, Message, next_message_seq
-from persona.models import Bot, BotIdentity, BotUserState
+from persona.models import Bot, BotIdentity, BotUserState, MemoryFragment
 from users.models import User
 
 
@@ -345,9 +346,18 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
         telegram_update_id=telegram_ids.get("update_id"),
     )
     now = timezone.now()
+    state = BotUserState.objects.filter(user=conversation.user, bot=conversation.bot).first()
+    if state:
+        BotUserState.objects.filter(id=state.id).update(
+            last_user_message_at=now,
+            total_user_messages=F("total_user_messages") + 1,
+            updated_at=now,
+        )
     Conversation.objects.filter(id=conversation.id).update(
         last_activity_at=now, last_user_message_at=now, has_unread_bot_message=False, updated_at=now
     )
+    if state:
+        _upsert_memory_fragment(state, text, now, source_ref=msg.id)
     _refresh_memory_summary(conversation)
     return msg
 
@@ -422,6 +432,31 @@ def _refresh_memory_summary(conversation: Conversation, *, max_chars: int = 900,
 
     Conversation.objects.filter(id=conversation.id).update(memory_summary=new_summary, updated_at=timezone.now())
     conversation.memory_summary = new_summary
+
+
+def _upsert_memory_fragment(state: BotUserState, text: str, now, source_ref):
+    topic = (state.bot.default_language or "general")[:64]
+    text_snippet = (text or "").strip()[:220]
+    if not text_snippet:
+        text_snippet = "interaction"
+    fragment, created = MemoryFragment.objects.get_or_create(
+        state=state,
+        topic=topic,
+        defaults={
+            "kind": MemoryFragment.Kind.TOPIC,
+            "hint_text": text_snippet,
+            "confidence": 0.55,
+            "source_ref": str(source_ref),
+            "last_seen_at": now,
+        },
+    )
+    if not created:
+        MemoryFragment.objects.filter(id=fragment.id).update(
+            hint_text=text_snippet,
+            last_seen_at=now,
+            times_reinforced=F("times_reinforced") + 1,
+            source_ref=str(source_ref),
+        )
 
 
 def _typing_delay(text: str) -> float:
