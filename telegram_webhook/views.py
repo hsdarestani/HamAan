@@ -17,6 +17,7 @@ from django.views.decorators.http import require_http_methods
 from billing.models import CoinPack, CoinTxn, Purchase, apply_coin_txn, ensure_wallet
 from chat.models import Conversation, LLMCallLog, Message, next_message_seq
 from persona.models import Bot, BotIdentity, BotUserState, MemoryFragment
+from persona.relationship import update_relationship_memory
 from users.models import User
 
 
@@ -358,6 +359,7 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
     )
     if state:
         _upsert_memory_fragment(state, text, now, source_ref=msg.id)
+        update_relationship_memory(state, _recent_user_texts(conversation), latest_text=text, now=now)
     _refresh_memory_summary(conversation)
     return msg
 
@@ -457,6 +459,15 @@ def _upsert_memory_fragment(state: BotUserState, text: str, now, source_ref):
             times_reinforced=F("times_reinforced") + 1,
             source_ref=str(source_ref),
         )
+
+
+def _recent_user_texts(conversation: Conversation, limit: int = 20) -> list[str]:
+    user_messages = (
+        conversation.messages.filter(role=Message.Role.USER)
+        .order_by("-seq")
+        .values_list("text", flat=True)[:limit]
+    )
+    return [text for text in user_messages if text]
 
 
 def _typing_delay(text: str) -> float:
