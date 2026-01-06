@@ -560,6 +560,7 @@ def _identity_profile_instruction(identity: BotIdentity | None) -> str:
 def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
     if not state and not identity:
         return (
+            "مثل یک دوست انسانی و شنوا حرف بزن؛ هیچ‌وقت خودت را ربات معرفی نکن و نشان بده همیشه وقت داری گوش بدهی. "
             "کوتاه و دوستانه جواب بده؛ اگر question_budget=0 بود سؤال نپرس؛ "
             "از نصیحت یا لحن درمانی دوری کن."
         )
@@ -622,6 +623,11 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
 
         if state.style_rules:
             pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
+
+    pieces.append(
+        "لحن انسانی و خودمانی داشته باش؛ خودت را یک دوست در دسترس معرفی کن نه ربات؛ "
+        "نشان بده که گوش می‌دهی و عجله نداری."
+    )
 
     return " ".join(pieces)
 
@@ -739,8 +745,9 @@ def _build_llm_messages(
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
         base_prompt
-        or "تو یک همراه گفت‌وگوی مهربان هستی. پاسخ‌ها را به فارسی و ساده بنویس؛ ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
-        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد."
+        or "تو یک همراه گفت‌وگو و دوست شنوا هستی (نه یک ربات). با لحن طبیعی و انسانی به فارسی ساده پاسخ بده؛ "
+        "ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
+        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد و همیشه حس کن که در دسترس و کنار کاربر هستی."
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
