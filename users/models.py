@@ -65,6 +65,11 @@ class User(AbstractBaseUser, PermissionsMixin, TimeStampedModel):
           AUTH_USER_MODEL = "users.User"
     """
 
+    class Gender(models.TextChoices):
+        MALE = "MALE", "Male"
+        FEMALE = "FEMALE", "Female"
+        UNKNOWN = "UNKNOWN", "Unknown"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     # Telegram identifiers
@@ -75,6 +80,12 @@ class User(AbstractBaseUser, PermissionsMixin, TimeStampedModel):
     first_name = models.CharField(max_length=128, blank=True, default="")
     last_name = models.CharField(max_length=128, blank=True, default="")
     language_code = models.CharField(max_length=12, blank=True, default="", db_index=True)
+    gender = models.CharField(
+        max_length=8,
+        choices=Gender.choices,
+        default=Gender.UNKNOWN,
+        db_index=True,
+    )
 
     # Operational flags
     is_active = models.BooleanField(default=True, db_index=True)

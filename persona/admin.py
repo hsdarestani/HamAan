@@ -5,9 +5,9 @@ from .models import Bot, BotIdentity, BotUserState, MemoryFragment, PromptSnippe
 
 @admin.register(Bot)
 class BotAdmin(admin.ModelAdmin):
-    list_display = ("code", "display_name", "is_active", "default_language", "max_output_chars")
-    list_filter = ("is_active", "default_language")
-    search_fields = ("code", "display_name")
+    list_display = ("code", "display_name", "gender", "is_active", "default_language", "max_output_chars")
+    list_filter = ("is_active", "default_language", "gender")
+    search_fields = ("code", "display_name", "gender")
     readonly_fields = ("created_at", "updated_at")
 
 
