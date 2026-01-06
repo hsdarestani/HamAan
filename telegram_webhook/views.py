@@ -104,6 +104,107 @@ def _get_default_bot() -> Bot | None:
     return Bot.objects.filter(is_active=True).order_by("created_at").first()
 
 
+def _default_identity_profile() -> dict[str, list[str]]:
+    return {
+        "values": ["گوش دادن", "راحت بودن"],
+        "dreams": ["گپ‌های طولانی شبانه"],
+        "favorites": ["چای دارچین"],
+    }
+
+
+def _personal_bot_code(template: Bot, user: User) -> str:
+    base = template.code or "bot"
+    suffix = str(user.telegram_id or "user")
+    code = f"{base}-u{suffix}".lower()
+    return code[:32]
+
+
+def _clone_identity_from_template(bot: Bot, template: Bot) -> None:
+    if BotIdentity.objects.filter(bot=bot).exists():
+        return
+
+    template_identity: BotIdentity | None = getattr(template, "identity", None)
+    profile = _default_identity_profile()
+    defaults = {
+        "core_tone": "WARM",
+        "background_seed": "FRESH_START",
+        "self_confidence": 0.35,
+        "openness": 0.32,
+        "talkativeness": 0.42,
+        "emotional_clarity": 0.35,
+        "memory_strength": 0.60,
+        "memory_noise": 0.15,
+        "identity_profile": profile,
+        "avoids_advice": True,
+        "avoids_therapy_tone": True,
+        "avoids_omniscience": True,
+    }
+
+    if template_identity:
+        profile = dict(template_identity.identity_profile or {})
+        if not profile:
+            profile = _default_identity_profile()
+        defaults.update(
+            {
+                "core_tone": template_identity.core_tone,
+                "background_seed": template_identity.background_seed,
+                "self_confidence": template_identity.self_confidence,
+                "openness": template_identity.openness,
+                "talkativeness": template_identity.talkativeness,
+                "emotional_clarity": template_identity.emotional_clarity,
+                "memory_strength": template_identity.memory_strength,
+                "memory_noise": template_identity.memory_noise,
+                "identity_profile": profile,
+                "avoids_advice": template_identity.avoids_advice,
+                "avoids_therapy_tone": template_identity.avoids_therapy_tone,
+                "avoids_omniscience": template_identity.avoids_omniscience,
+            }
+        )
+
+    BotIdentity.objects.get_or_create(bot=bot, defaults=defaults)
+
+
+def _ensure_personal_bot(user: User) -> Bot | None:
+    template = _get_default_bot()
+    if not template:
+        return None
+
+    code = _personal_bot_code(template, user)
+    name_hint = user.first_name or user.telegram_username or "دوست"
+    personal_prompt = template.base_prompt_text.strip() if template.base_prompt_text else ""
+    personal_hint = (
+        f"این بات همراه اختصاصی {name_hint} است؛ لحن انسانی و خودمانی داشته باش، "
+        "گاهی یک اشاره کوتاه به حال و هوای خودت یا اینکه مشغول گوش دادن هستی بکن، "
+        "ولی داستان‌پردازی نکن."
+    )
+    if personal_prompt:
+        personal_prompt = f"{personal_prompt}\n{personal_hint}"
+    else:
+        personal_prompt = (
+            "تو یک همراه گفت‌وگو و دوست شنوا هستی. کوتاه و صمیمی به فارسی پاسخ بده و خودت را ربات معرفی نکن. "
+            + personal_hint
+        )
+
+    bot_defaults = {
+        "display_name": f"{template.display_name} ({name_hint})"[:48],
+        "is_active": True,
+        "base_prompt_id": template.base_prompt_id,
+        "base_prompt_text": personal_prompt,
+        "default_language": template.default_language,
+        "avatar_key": template.avatar_key,
+        "max_output_chars": template.max_output_chars,
+        "max_questions_per_reply": template.max_questions_per_reply,
+    }
+    bot, _ = Bot.objects.get_or_create(code=code, defaults=bot_defaults)
+    _clone_identity_from_template(bot, template)
+
+    if user.assigned_bot_id != bot.id:
+        user.assigned_bot = bot
+        user.save(update_fields=["assigned_bot", "updated_at"])
+
+    return bot
+
+
 def _resolve_user_bot(user: User) -> Bot | None:
     """
     Ensure every user has a persistent bot anchor.
@@ -112,6 +213,10 @@ def _resolve_user_bot(user: User) -> Bot | None:
     """
     if user.assigned_bot:
         return user.assigned_bot
+
+    personal_bot = _ensure_personal_bot(user)
+    if personal_bot:
+        return personal_bot
 
     bot = _get_default_bot()
     if bot:
@@ -135,11 +240,8 @@ def _touch_user(telegram_payload: dict[str, Any]) -> User:
         "last_seen_at": timezone.now(),
     }
     user, created = User.objects.update_or_create(telegram_id=int(telegram_id), defaults=defaults)
-    if created and not user.assigned_bot:
-        default_bot = _get_default_bot()
-        if default_bot:
-            user.assigned_bot = default_bot
-            user.save(update_fields=["assigned_bot", "updated_at"])
+    if not user.assigned_bot:
+        _ensure_personal_bot(user)
     ensure_wallet(user)
     return user
 
