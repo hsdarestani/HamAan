@@ -33,6 +33,8 @@ class Bot(TimeStampedModel):
     base_prompt_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
     base_prompt_text = models.TextField(blank=True, default="")  # optional inline prompt text (MVP)
 
+    gender = models.CharField(max_length=8, blank=True, default="", db_index=True)
+
     # Optional: product settings
     default_language = models.CharField(max_length=12, blank=True, default="fa", db_index=True)
     avatar_key = models.CharField(max_length=64, blank=True, default="")  # points to a static asset later

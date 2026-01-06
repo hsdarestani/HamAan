@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -112,6 +113,107 @@ def _default_identity_profile() -> dict[str, list[str]]:
     }
 
 
+_FEMALE_BOT_NAMES = [
+    "سارا",
+    "نگار",
+    "آوا",
+    "هانیه",
+    "ندا",
+    "مهسا",
+    "پرستو",
+    "نرگس",
+    "یاسمن",
+    "النا",
+]
+
+_MALE_BOT_NAMES = [
+    "علی",
+    "رضا",
+    "مهدی",
+    "سینا",
+    "پویان",
+    "کامران",
+    "سامان",
+    "بهزاد",
+    "کیوان",
+    "فرهاد",
+]
+
+
+def _pick_bot_gender(user: User) -> str:
+    """Select a gender opposite to the user when known; default to female."""
+
+    gender = (user.gender or "").upper()
+    if gender == "MALE":
+        return "FEMALE"
+    if gender == "FEMALE":
+        return "MALE"
+    return "FEMALE"
+
+
+def _pick_bot_name(gender: str, user: User) -> str:
+    """Choose a stable Iranian human name for the bot based on gender and user."""
+
+    names = _FEMALE_BOT_NAMES if gender == "FEMALE" else _MALE_BOT_NAMES
+    if not names:
+        return "دوست"
+    key = f"{gender}:{user.telegram_id or user.id}"
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    idx = int.from_bytes(digest[:4], "big") % len(names)
+    return names[idx]
+
+
+def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
+    """
+    Use the LLM to generate a random Iranian name and a lightweight identity profile.
+
+    Returns a dict like:
+    {
+        "name": "...",
+        "identity_profile": {"values": [...], "dreams": [...], "favorites": [...]},
+    }
+    """
+
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.warning("telegram_webhook: missing OPENAI_API_KEY, using fallback bot traits")
+        return {}
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    name_hint = user.first_name or user.telegram_username or "دوست"
+    try:
+        response = openai_client.chat.completions.create(
+            model=model,
+            temperature=0.9,
+            max_tokens=180,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are generating traits for a Persian-speaking companion bot. "
+                        "Respond ONLY with JSON. Use short Persian phrases. "
+                        "Pick a single Iranian first name matching the provided gender. "
+                        "Keep identity lists to 1-3 short items each."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "gender": gender,
+                            "user_hint": name_hint,
+                            "needs": ["name", "identity_profile"],
+                        }
+                    ),
+                },
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        return json.loads(content)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: llm traits failed (%s), using fallback bot traits", exc)
+        return {}
+
+
 def _personal_bot_code(template: Bot, user: User) -> str:
     base = template.code or "bot"
     suffix = str(user.telegram_id or "user")
@@ -119,12 +221,15 @@ def _personal_bot_code(template: Bot, user: User) -> str:
     return code[:32]
 
 
-def _clone_identity_from_template(bot: Bot, template: Bot) -> None:
-    if BotIdentity.objects.filter(bot=bot).exists():
+def _clone_identity_from_template(bot: Bot, template: Bot, *, identity_profile: dict[str, Any] | None = None) -> None:
+    existing_identity = BotIdentity.objects.filter(bot=bot).first()
+    if existing_identity:
+        if identity_profile:
+            BotIdentity.objects.filter(bot=bot).update(identity_profile=identity_profile, updated_at=timezone.now())
         return
 
     template_identity: BotIdentity | None = getattr(template, "identity", None)
-    profile = _default_identity_profile()
+    profile = identity_profile or _default_identity_profile()
     defaults = {
         "core_tone": "WARM",
         "background_seed": "FRESH_START",
@@ -141,9 +246,8 @@ def _clone_identity_from_template(bot: Bot, template: Bot) -> None:
     }
 
     if template_identity:
-        profile = dict(template_identity.identity_profile or {})
-        if not profile:
-            profile = _default_identity_profile()
+        template_profile = dict(template_identity.identity_profile or {})
+        profile = profile or template_profile or _default_identity_profile()
         defaults.update(
             {
                 "core_tone": template_identity.core_tone,
@@ -154,7 +258,7 @@ def _clone_identity_from_template(bot: Bot, template: Bot) -> None:
                 "emotional_clarity": template_identity.emotional_clarity,
                 "memory_strength": template_identity.memory_strength,
                 "memory_noise": template_identity.memory_noise,
-                "identity_profile": profile,
+                "identity_profile": profile or template_profile or _default_identity_profile(),
                 "avoids_advice": template_identity.avoids_advice,
                 "avoids_therapy_tone": template_identity.avoids_therapy_tone,
                 "avoids_omniscience": template_identity.avoids_omniscience,
@@ -170,6 +274,10 @@ def _ensure_personal_bot(user: User) -> Bot | None:
         return None
 
     code = _personal_bot_code(template, user)
+    gender = _pick_bot_gender(user)
+    traits = _llm_personal_traits(user, gender)
+    bot_name = (traits.get("name") or "").strip() if isinstance(traits, dict) else ""
+    bot_name = bot_name or _pick_bot_name(gender, user)
     name_hint = user.first_name or user.telegram_username or "دوست"
     personal_prompt = template.base_prompt_text.strip() if template.base_prompt_text else ""
     personal_hint = (
@@ -186,7 +294,7 @@ def _ensure_personal_bot(user: User) -> Bot | None:
         )
 
     bot_defaults = {
-        "display_name": f"{template.display_name} ({name_hint})"[:48],
+        "display_name": bot_name,
         "is_active": True,
         "base_prompt_id": template.base_prompt_id,
         "base_prompt_text": personal_prompt,
@@ -194,9 +302,21 @@ def _ensure_personal_bot(user: User) -> Bot | None:
         "avatar_key": template.avatar_key,
         "max_output_chars": template.max_output_chars,
         "max_questions_per_reply": template.max_questions_per_reply,
+        "gender": gender,
     }
     bot, _ = Bot.objects.get_or_create(code=code, defaults=bot_defaults)
-    _clone_identity_from_template(bot, template)
+    updates = {}
+    if bot.gender != gender:
+        updates["gender"] = gender
+    if bot.display_name != bot_name:
+        updates["display_name"] = bot_name
+    if updates:
+        updates["updated_at"] = timezone.now()
+        Bot.objects.filter(id=bot.id).update(**updates)
+    identity_profile = {}
+    if isinstance(traits, dict):
+        identity_profile = traits.get("identity_profile") or {}
+    _clone_identity_from_template(bot, template, identity_profile=identity_profile)
 
     if user.assigned_bot_id != bot.id:
         user.assigned_bot = bot
