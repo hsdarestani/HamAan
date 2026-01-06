@@ -6,6 +6,7 @@ urlpatterns = [
     path("conversations/create-or-get/", views.ConversationCreateOrGetView, name="conversation-create-or-get"),
     path("conversations/", views.ConversationListView, name="conversation-list"),
     path("conversations/detail/", views.ConversationDetailView, name="conversation-detail"),
+    path("conversations/update/", views.ConversationUpdateView, name="conversation-update"),
     path("messages/", views.MessageListView, name="message-list"),
     path("messages/user/", views.MessageCreateUserView, name="message-create-user"),
     path("messages/bot/", views.MessageCreateBotView, name="message-create-bot"),
