@@ -2,8 +2,10 @@ import json
 from uuid import UUID
 
 from django.http import HttpResponseBadRequest, JsonResponse
+from django.db import IntegrityError
 from django.db.models import F
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
@@ -328,3 +330,212 @@ def LLMCallLogListView(request):
             ],
         }
     )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def ConversationUpdateView(request):
+    """
+    Allow the bot runtime to update its own configuration based on a conversation.
+
+    This endpoint intentionally accepts multiple update targets in one call so an agent
+    can react to conversation messages by:
+      - adjusting per-user preferences (UserPrefs)
+      - nudging the bot's identity (BotIdentity)
+      - updating the per-user state (BotUserState)
+      - tweaking initiation rules and creating initiation events
+      - appending bot/user messages
+      - upserting memory fragments
+    """
+
+    data = _load_json(request)
+    conversation = _get_conversation_from_request(data, request.GET)
+    if not conversation:
+        return JsonResponse({"ok": False, "error": "conversation_not_found"}, status=404)
+
+    state, prefs = _ensure_user_context(conversation.user, conversation.bot)
+    now = timezone.now()
+    results: dict[str, object] = {"conversation_id": str(conversation.id)}
+
+    # User preferences
+    prefs_payload = data.get("user_prefs")
+    if isinstance(prefs_payload, dict):
+        allowed_fields = {
+            "reply_length",
+            "question_tolerance",
+            "tone",
+            "emotional_distance",
+            "verbosity",
+            "prefers_initiation",
+            "initiation_cooldown_hours",
+            "quiet_hours_enabled",
+            "quiet_hours_start",
+            "quiet_hours_end",
+            "style_rules",
+        }
+        updates = {k: v for k, v in prefs_payload.items() if k in allowed_fields}
+        if updates:
+            for key, value in updates.items():
+                setattr(prefs, key, value)
+            prefs.save(update_fields=[*updates.keys(), "updated_at"])
+            results["user_prefs_updated"] = sorted(updates.keys())
+
+    # Bot identity
+    identity_payload = data.get("bot_identity")
+    if isinstance(identity_payload, dict):
+        identity, _ = BotIdentity.objects.get_or_create(bot=conversation.bot)
+        allowed_fields = {
+            "core_tone",
+            "background_seed",
+            "self_confidence",
+            "openness",
+            "talkativeness",
+            "emotional_clarity",
+            "memory_strength",
+            "memory_noise",
+            "identity_profile",
+            "avoids_advice",
+            "avoids_therapy_tone",
+            "avoids_omniscience",
+        }
+        updates = {k: v for k, v in identity_payload.items() if k in allowed_fields}
+        if updates:
+            BotIdentity.objects.filter(bot=conversation.bot).update(**updates, updated_at=now)
+            results["bot_identity_updated"] = sorted(updates.keys())
+
+    # Bot (global) fields
+    bot_payload = data.get("bot")
+    if isinstance(bot_payload, dict):
+        allowed_fields = {
+            "display_name",
+            "base_prompt_id",
+            "base_prompt_text",
+            "default_language",
+            "avatar_key",
+            "max_output_chars",
+            "max_questions_per_reply",
+            "is_active",
+        }
+        updates = {k: v for k, v in bot_payload.items() if k in allowed_fields}
+        if updates:
+            Bot.objects.filter(id=conversation.bot_id).update(**updates, updated_at=now)
+            results["bot_updated"] = sorted(updates.keys())
+
+    # BotUserState
+    state_payload = data.get("bot_user_state")
+    if isinstance(state_payload, dict):
+        allowed_fields = {
+            "familiarity",
+            "trust",
+            "emotional_closeness",
+            "user_pref_verbosity",
+            "user_pref_questions",
+            "shared_silence",
+            "conflict_count",
+            "style_rules",
+            "relationship_memory",
+            "initiation_opt_in",
+        }
+        updates = {k: v for k, v in state_payload.items() if k in allowed_fields}
+        if updates:
+            BotUserState.objects.filter(id=state.id).update(**updates, updated_at=now)
+            results["bot_user_state_updated"] = sorted(updates.keys())
+
+    # Initiation rule tweaks
+    initiation_rule_payload = data.get("initiation_rule")
+    if isinstance(initiation_rule_payload, dict):
+        rule, _ = InitiationRule.objects.get_or_create(bot=conversation.bot)
+        allowed_fields = {
+            "enabled",
+            "cooldown_hours",
+            "max_per_day",
+            "max_per_week",
+            "min_familiarity",
+            "min_trust",
+            "allowed_start_hour",
+            "allowed_end_hour",
+            "max_chars",
+            "allow_question",
+            "templates",
+        }
+        updates = {k: v for k, v in initiation_rule_payload.items() if k in allowed_fields}
+        if updates:
+            InitiationRule.objects.filter(id=rule.id).update(**updates, updated_at=now)
+            results["initiation_rule_updated"] = sorted(updates.keys())
+
+    # Initiation event creation (scheduled message)
+    initiation_event_payload = data.get("initiation_event")
+    if isinstance(initiation_event_payload, dict):
+        scheduled_for = initiation_event_payload.get("scheduled_for")
+        scheduled_dt = parse_datetime(str(scheduled_for)) if scheduled_for else None
+        try:
+            event = InitiationEvent.objects.create(
+                state=state,
+                bot=conversation.bot,
+                user=conversation.user,
+                trigger=initiation_event_payload.get("trigger") or InitiationEvent.Trigger.MANUAL,
+                status=initiation_event_payload.get("status") or InitiationEvent.Status.PLANNED,
+                scheduled_for=scheduled_dt,
+                message_text=initiation_event_payload.get("message_text", "")[:220],
+                idempotency_key=initiation_event_payload.get("idempotency_key", "")[:128],
+                meta=initiation_event_payload.get("meta", {}),
+            )
+            results["initiation_event_id"] = str(event.id)
+        except IntegrityError:
+            existing = InitiationEvent.objects.filter(
+                state=state, idempotency_key=initiation_event_payload.get("idempotency_key", "")
+            ).first()
+            if existing:
+                results["initiation_event_id"] = str(existing.id)
+
+    # Message append (user/bot/system)
+    created_messages: list[dict[str, object]] = []
+    for message_payload in data.get("messages", []) or []:
+        role = message_payload.get("role")
+        if role not in (Message.Role.USER, Message.Role.BOT, Message.Role.SYSTEM):
+            continue
+        text = message_payload.get("text", "")
+        telegram_ids = {
+            "telegram_message_id": message_payload.get("telegram_message_id"),
+            "telegram_update_id": message_payload.get("telegram_update_id"),
+        }
+        message = _create_message(conversation, role, text, telegram_ids=telegram_ids)
+        created_messages.append({"id": str(message.id), "role": message.role, "seq": message.seq})
+    if created_messages:
+        results["messages_created"] = created_messages
+
+    # Memory fragments upsert
+    fragment_results: list[dict[str, object]] = []
+    for fragment_payload in data.get("memory_fragments", []) or []:
+        fragment_id = fragment_payload.get("fragment_id") or fragment_payload.get("id")
+        last_seen = None
+        if fragment_payload.get("last_seen_at"):
+            last_seen = parse_datetime(str(fragment_payload.get("last_seen_at")))
+
+        attrs = {
+            "kind": fragment_payload.get("kind") or MemoryFragment.Kind.TOPIC,
+            "topic": fragment_payload.get("topic", "") or "",
+            "hint_text": (fragment_payload.get("hint_text", "") or "")[:220],
+            "confidence": float(fragment_payload.get("confidence", 0.55)),
+            "times_reinforced": int(fragment_payload.get("times_reinforced", 1)),
+            "is_active": fragment_payload.get("is_active", True),
+        }
+        if last_seen:
+            attrs["last_seen_at"] = last_seen
+
+        if fragment_id:
+            try:
+                fragment = MemoryFragment.objects.get(id=UUID(str(fragment_id)), state=state)
+            except (MemoryFragment.DoesNotExist, ValueError, TypeError):
+                continue
+            for key, value in attrs.items():
+                setattr(fragment, key, value)
+            fragment.save()
+            fragment_results.append({"id": str(fragment.id), "updated": True})
+        else:
+            fragment = MemoryFragment.objects.create(state=state, **attrs)
+            fragment_results.append({"id": str(fragment.id), "created": True})
+    if fragment_results:
+        results["memory_fragments"] = fragment_results
+
+    return JsonResponse({"ok": True, "results": results})
