@@ -779,6 +779,62 @@ def _identity_profile_instruction(identity: BotIdentity | None) -> str:
     )
 
 
+def _bot_name_instruction(bot: Bot) -> str:
+    name = (bot.display_name or "").strip()
+    if not name:
+        return ""
+    return f"نام تو «{name}» است. اگر کاربر درباره نامت پرسید، دقیقاً همین نام را بگو."
+
+
+def _relationship_memory_instruction(state: BotUserState | None) -> str:
+    if not state:
+        return ""
+    memory = state.relationship_memory or {}
+
+    def _clean_list(key: str, limit: int) -> list[str]:
+        raw = memory.get(key) or []
+        return [str(item).strip() for item in raw if str(item).strip()][:limit]
+
+    shared_topics = _clean_list("shared_topics", 6)
+    nicknames = _clean_list("nicknames", 4)
+    recent_feelings = _clean_list("recent_feelings", 5)
+
+    parts = []
+    if shared_topics:
+        parts.append(f"موضوعات مشترک: {', '.join(shared_topics)}")
+    if nicknames:
+        parts.append(f"لقب‌ها: {', '.join(nicknames)}")
+    if recent_feelings:
+        parts.append(f"حس‌های اخیر: {', '.join(recent_feelings)}")
+
+    if not parts:
+        return ""
+
+    return (
+        "حافظه رابطه → "
+        + " | ".join(parts)
+        + ". اگر مرتبط بود، یک اشاره کوتاه و طبیعی داشته باش؛ اغراق یا ادعا نکن."
+    )
+
+
+def _memory_fragments_instruction(state: BotUserState | None) -> str:
+    if not state:
+        return ""
+    fragments = list(
+        state.memory_fragments.filter(is_active=True)
+        .order_by("-confidence", "-last_seen_at")
+        .values_list("hint_text", flat=True)[:3]
+    )
+    cleaned = [str(fragment).strip() for fragment in fragments if str(fragment).strip()]
+    if not cleaned:
+        return ""
+    return (
+        "یادآوری‌های کوتاه → "
+        + " | ".join(cleaned)
+        + ". اگر مرتبط بود، به‌شکل کوتاه و طبیعی اشاره کن."
+    )
+
+
 def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
     if not state and not identity:
         return (
@@ -981,6 +1037,15 @@ def _build_llm_messages(
         {"role": "system", "content": mode_hint},
         {"role": "system", "content": f"توضیح حالت: {mode_reason}"},
     ]
+    name_hint = _bot_name_instruction(bot)
+    if name_hint:
+        messages.append({"role": "system", "content": name_hint})
+    relationship_hint = _relationship_memory_instruction(state)
+    if relationship_hint:
+        messages.append({"role": "system", "content": relationship_hint})
+    memory_hint = _memory_fragments_instruction(state)
+    if memory_hint:
+        messages.append({"role": "system", "content": memory_hint})
     template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
     messages.append({"role": "system", "content": template_hint})
     summary = (conversation.memory_summary or "").strip()
