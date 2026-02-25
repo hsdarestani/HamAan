@@ -9,7 +9,7 @@ from typing import Any
 
 from datetime import datetime
 import requests
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 from django.db.models import F
 from django.http import HttpResponseBadRequest, HttpResponseForbidden, JsonResponse
@@ -69,7 +69,7 @@ def _get_ai_client() -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
         return None
-    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=_get_ai_timeout_seconds())
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=_get_ai_timeout_seconds(), max_retries=0)
 
 
 
@@ -1181,6 +1181,23 @@ def _normalize_colloquial_fa(reply_text: str) -> str:
     return fixed
 
 
+def _quick_fallback_reply(normalized_user_text: str) -> str:
+    text = (normalized_user_text or "").strip()
+    if not text:
+        return "سلام، بگو چی شده."
+
+    lower = text.lower()
+    if any(k in text for k in ["خستم", "داغون", "ناراحت", "حالم بده", "اعصابم"]):
+        return "اوف، سنگین بوده… چی بیشتر اذیتت کرد؟"
+    if "؟" in text or "?" in text:
+        return "اوکی، مستقیم بگم: الان دقیق‌ترین جواب اینه که باید قدم‌به‌قدم جلو بریم."
+    if any(k in text for k in ["سلام", "درود", "hi", "hello"]):
+        return "سلام، خوبی؟"
+    if len(text.split()) <= 3:
+        return "یکم بیشتر بگو دقیقاً چی می‌خوای."
+    return "گرفتم چی میگی. خلاصه بگم: با همون مسیر ساده جلو بریم بهتره."
+
+
 def _apply_question_budget_to_reply(reply_text: str, question_budget: int) -> str:
     if question_budget > 0:
         return reply_text
@@ -1323,7 +1340,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     )
     started = time.monotonic()
     try:
-        max_tokens = min(768, bot.max_output_chars * 3)
+        max_tokens = min(160, max(64, bot.max_output_chars // 2))
         response = ai_client.chat.completions.create(
             model=model,
             messages=prompt_messages,
@@ -1346,8 +1363,23 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.request_id = getattr(response, "id", "")
         log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
         return {"text": reply_text, "token_in": token_in, "token_out": token_out}
+    except APITimeoutError as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        fallback_text = _quick_fallback_reply(normalized_user_text)
+        log.status = LLMCallLog.Status.ERROR
+        log.error_message = f"timeout:{str(exc)}"[:255]
+        log.latency_ms = latency_ms
+        log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
+        logger.warning(
+            "telegram_webhook: ai timeout conversation=%s bot=%s latency_ms=%s -> fallback",
+            conversation.id,
+            bot.id,
+            latency_ms,
+        )
+        return {"text": fallback_text, "token_in": 0, "token_out": 0}
     except Exception as exc:  # noqa: BLE001
         latency_ms = int((time.monotonic() - started) * 1000)
+        fallback_text = _quick_fallback_reply(normalized_user_text)
         log.status = LLMCallLog.Status.ERROR
         log.error_message = str(exc)[:255]
         log.latency_ms = latency_ms
@@ -1355,7 +1387,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         logger.exception(
             "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
         )
-        return None
+        return {"text": fallback_text, "token_in": 0, "token_out": 0}
 
 
 def _send_replies(chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None) -> bool:
