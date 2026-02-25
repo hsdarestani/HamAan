@@ -56,11 +56,20 @@ def _get_ai_model() -> str:
     return (os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL).strip()
 
 
+def _get_ai_timeout_seconds() -> float:
+    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "1.4").strip()
+    try:
+        timeout = float(raw)
+    except Exception:  # noqa: BLE001
+        timeout = 1.4
+    return min(max(timeout, 0.8), 5.0)
+
+
 def _get_ai_client() -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
         return None
-    return OpenAI(api_key=api_key, base_url=_get_ai_base_url())
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=_get_ai_timeout_seconds())
 
 
 
@@ -867,11 +876,11 @@ def _recent_user_texts(conversation: Conversation, limit: int = 20) -> list[str]
 
 
 def _typing_delay(text: str) -> float:
-    # Roughly model human typing rhythm; clamp to avoid long sleeps.
-    base = 0.4
-    per_char = 0.012
+    # Fast-reply mode: keep Telegram typing simulation minimal to hit sub-2s UX.
+    base = 0.05
+    per_char = 0.0015
     delay = base + len(text) * per_char
-    return max(0.35, min(delay, 2.2))
+    return max(0.04, min(delay, 0.22))
 
 
 def _split_reply(text: str, limit: int) -> list[str]:
@@ -1444,7 +1453,7 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
 
     generation = _generate_ai_reply(conversation, bot, normalized)
     if not generation:
-        bot_reply = _record_bot_message(conversation, "فعلاً نمی‌تونم جواب بدم. کمی بعد دوباره امتحان کن.")
+        bot_reply = _record_bot_message(conversation, "الان یکم کند شد؛ سریع دوباره بگو.")
         return [_reply_payload(bot_reply.text)]
 
     reply_limit = max(bot.max_output_chars, 500)

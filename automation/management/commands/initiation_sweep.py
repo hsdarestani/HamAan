@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -167,15 +168,15 @@ def _build_message(state: BotUserState, ctx: EligibilityContext) -> str:
 
     if ctx.rule.allow_question:
         followups = [
-            "امیدوارم حالت خوب باشه.",
-            "یه لحظه سر زدم که بدونی هستم.",
-            "هوات رو دارم.",
+            "گفتم یه احوالی بگیرم، چطوری؟",
+            "یه سر زدم ببینم روزت چطور گذشت؟",
+            "خلاصه بگو امروز چه خبر بود؟",
         ]
     else:
         followups = [
-            "فقط خواستم بدونی هستم.",
-            "لازم نیست جواب بدی، حواسم هست.",
-            "یه یادآوری کوتاه که فراموشت نکردم.",
+            "فقط گفتم یه سلام بدم.",
+            "لازم نیست جواب بدی، فقط خواستم یادم باشی.",
+            "یه سر زدم، همین.",
         ]
     lines.append(random.choice(followups))
 
@@ -261,6 +262,64 @@ def _deliver_event(event: InitiationEvent) -> InitiationEvent.Status:
     )
     return status
 
+
+
+
+def _preferred_contact_hours(state: BotUserState) -> list[int]:
+    """Infer preferred local hours from recent user messages + onboarding preference."""
+
+    user_tz = _user_timezone(state.user)
+    recent = list(
+        Message.objects.filter(conversation__user=state.user, conversation__bot=state.bot, role=Message.Role.USER)
+        .order_by("-created_at")
+        .values_list("created_at", flat=True)[:120]
+    )
+
+    counter: Counter[int] = Counter()
+    for dt in recent:
+        if not dt:
+            continue
+        local = dt.astimezone(user_tz)
+        counter[local.hour] += 1
+
+    # onboarding hint can bias hour selection
+    onboarding = (state.style_rules or {}).get("onboarding_v1") or {}
+    active_hint = ((onboarding.get("answers") or {}).get("active_time_pattern") or "").strip()
+    if "شب" in active_hint:
+        for h in (20, 21, 22, 23):
+            counter[h] += 2
+    elif "روز" in active_hint:
+        for h in (10, 11, 12, 13, 14, 15, 16):
+            counter[h] += 2
+
+    if not counter:
+        return [11, 20]
+
+    top = [hour for hour, _ in counter.most_common(3)]
+    return sorted(set(top))
+
+
+def _schedule_for_preferred_window(state: BotUserState, now: datetime) -> tuple[datetime, int]:
+    user_tz = _user_timezone(state.user)
+    preferred_hours = _preferred_contact_hours(state)
+
+    local_now = now.astimezone(user_tz)
+    candidates: list[datetime] = []
+    for day_offset in (0, 1):
+        date = local_now.date() + timedelta(days=day_offset)
+        for hour in preferred_hours:
+            candidate = datetime(date.year, date.month, date.day, hour, random.randint(2, 44), tzinfo=user_tz)
+            if candidate > local_now + timedelta(minutes=2):
+                candidates.append(candidate)
+
+    if not candidates:
+        fallback = local_now + timedelta(hours=6)
+        candidates = [fallback]
+
+    chosen_local = min(candidates)
+    chosen_utc = chosen_local.astimezone(timezone.utc)
+    jitter_seconds = int((chosen_utc - now).total_seconds())
+    return chosen_utc, max(jitter_seconds, 0)
 
 def _due_events(now: datetime) -> list[InitiationEvent]:
     return list(
@@ -349,13 +408,12 @@ def run_initiation_sweep() -> dict[str, int]:
             summary["skipped"] += 1
             continue
 
-        idem_key = f"{state.id}:{now.date().isoformat()}"
+        idem_key = f"{state.id}:{now.date().isoformat()}:{now.hour // 6}"
         if InitiationEvent.objects.filter(state=state, idempotency_key=idem_key).exists():
             summary["skipped"] += 1
             continue
 
-        jitter_seconds = random.randint(45, 240)
-        scheduled_for = now + timedelta(seconds=jitter_seconds)
+        scheduled_for, jitter_seconds = _schedule_for_preferred_window(state, now)
         message_text = _build_message(state, ctx)
         InitiationEvent.objects.create(
             state=state,
