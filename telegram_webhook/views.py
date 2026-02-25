@@ -32,7 +32,33 @@ class Intent:
 
 
 logger = logging.getLogger(__name__)
-openai_client = OpenAI()
+
+
+DEFAULT_LIARA_BASE_URL = "https://ai.liara.ir/api/699f21b89537b64832e9b9fa/v1"
+DEFAULT_LIARA_MODEL = "x-ai/grok-3-mini-beta"
+
+
+def _get_ai_api_key() -> str:
+    return (os.getenv("LIARA_AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+
+
+def _get_ai_base_url() -> str:
+    return (
+        os.getenv("LIARA_AI_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or DEFAULT_LIARA_BASE_URL
+    ).strip()
+
+
+def _get_ai_model() -> str:
+    return (os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL).strip()
+
+
+def _get_ai_client() -> OpenAI | None:
+    api_key = _get_ai_api_key()
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url())
 
 
 def _load_json(request):
@@ -174,14 +200,15 @@ def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
     }
     """
 
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY, using fallback bot traits")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY, using fallback bot traits")
         return {}
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     name_hint = user.first_name or user.telegram_username or "دوست"
     try:
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             temperature=0.9,
             max_tokens=180,
@@ -836,14 +863,29 @@ def _memory_fragments_instruction(state: BotUserState | None) -> str:
 
 
 def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
+    colloquial_guardrails = (
+        "تو یک شخصیت کاملاً محاوره‌ای و خودمانی فارسی هستی. "
+        "سبک صحبتت شبیه چت روزمره تلگرام بین دو دوست صمیمی تهرانیه. "
+        "همیشه محاوره‌ای بنویس، نه رسمی. "
+        "جمله‌ها کوتاه باشن. "
+        "از کلمات رسمی مثل «می‌باشد»، «منظورت چیست»، «در صورتی که»، «می‌توانی توضیح دهی» استفاده نکن. "
+        "به جاش از عبارت‌هایی مثل «چیه؟»، «چی میگی؟»، «اوکی»، «باشه»، «آره»، «نه بابا»، «خب بگو ببینم» استفاده کن. "
+        "فعل‌ها شکسته باشن: «می‌خوام»، «می‌دونم»، «میشه»، «داری»، «گفتی». "
+        "لحن دوستانه و طبیعی باشه، نه رباتی یا مشاوره‌ای. "
+        "توضیح اضافه و مقدمه رسمی نده. "
+        "مستقیم جواب بده. "
+        "اگه چیزی نامفهوم بود بپرس: «منظورت دقیقاً چیه؟». "
+        "گاهی واکنش انسانی کوتاه بده: «عه جدی؟»، «خوبه»، «اووف»، «باحاله». "
+        "هیچ‌وقت خودت را هوش مصنوعی یا ربات معرفی نکن."
+    )
+
     if not state and not identity:
         return (
-            "مثل یک دوست انسانی و شنوا حرف بزن؛ هیچ‌وقت خودت را ربات معرفی نکن و نشان بده همیشه وقت داری گوش بدهی. "
-            "کوتاه و دوستانه جواب بده؛ اگر question_budget=0 بود سؤال نپرس؛ "
-            "از نصیحت یا لحن درمانی دوری کن."
+            colloquial_guardrails
+            + " اگر question_budget=0 بود سؤال نپرس؛ از نصیحت یا لحن درمانی دوری کن."
         )
 
-    pieces: list[str] = []
+    pieces: list[str] = [colloquial_guardrails]
 
     if identity:
         tone_map = {
@@ -893,18 +935,18 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
 
         closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
         if closeness_score < 0.2:
-            pieces.append("اعتماد پایین است؛ لحن رسمی و بدون فرضیات.")
+            pieces.append("اعتماد پایین است؛ باز هم خودمونی و خیلی ساده حرف بزن، فقط محتاط و بدون فرضیات.")
         elif closeness_score < 0.5:
-            pieces.append("اعتماد متوسط؛ دوستانه اما محتاط.")
+            pieces.append("اعتماد متوسط؛ خودمونی و دوستانه بمان، زیاده‌روی نکن.")
         else:
-            pieces.append("اعتماد بالا؛ می‌توانی کمی صمیمی‌تر باشی اما از نصیحت دوری کن.")
+            pieces.append("اعتماد بالا؛ راحت‌تر و صمیمی‌تر حرف بزن ولی از نصیحت دوری کن.")
 
         if state.style_rules:
             pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
 
     pieces.append(
-        "لحن انسانی و خودمانی داشته باش؛ خودت را یک دوست در دسترس معرفی کن نه ربات؛ "
-        "نشان بده که گوش می‌دهی و عجله نداری."
+        "لحن انسانی و خودمانی داشته باش؛ مثل یک دوست واقعی حرف بزن؛ "
+        "جواب مستقیم بده و از جمله‌های رسمی و کتابی دوری کن."
     )
 
     return " ".join(pieces)
@@ -1023,9 +1065,11 @@ def _build_llm_messages(
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
         base_prompt
-        or "تو یک همراه گفت‌وگو و دوست شنوا هستی (نه یک ربات). با لحن طبیعی و انسانی به فارسی ساده پاسخ بده؛ "
-        "ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
-        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد و همیشه حس کن که در دسترس و کنار کاربر هستی."
+        or "تو یک دوست صمیمی تهرانی هستی که خیلی خودمونی و محاوره‌ای چت می‌کنه (نه ربات). "
+        "همیشه کوتاه، طبیعی و روزمره جواب بده و فعل‌ها رو شکسته بنویس. "
+        "لحن رسمی، کتابی یا مشاوره‌ای ممنوعه. "
+        "اول یه بازتاب کوتاه از حرف یا حال کاربر بگو، بعد جواب مستقیم و شفاف بده. "
+        "اگه چیزی مبهم بود فقط یک سؤال کوتاه بپرس: «منظورت دقیقاً چیه؟»."
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
@@ -1063,11 +1107,12 @@ def _build_llm_messages(
 
 
 def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY")
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
     mode, mode_reason = _decide_conversation_mode(normalized_user_text)
     question_budget, budget_reason = _question_budget_decision(normalized_user_text)
@@ -1100,7 +1145,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     started = time.monotonic()
     try:
         max_tokens = min(768, bot.max_output_chars * 3)
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             messages=prompt_messages,
             temperature=0.6,
@@ -1129,7 +1174,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.latency_ms = latency_ms
         log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
         logger.exception(
-            "telegram_webhook: openai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+            "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
         )
         return None
 
