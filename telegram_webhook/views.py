@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from datetime import datetime
@@ -32,8 +34,187 @@ class Intent:
 
 
 logger = logging.getLogger(__name__)
-openai_client = OpenAI()
 
+
+DEFAULT_LIARA_BASE_URL = "https://ai.liara.ir/api/699f21b89537b64832e9b9fa/v1"
+DEFAULT_LIARA_MODEL = "x-ai/grok-3-mini-beta"
+
+
+def _get_ai_api_key() -> str:
+    return (os.getenv("LIARA_AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+
+
+def _get_ai_base_url() -> str:
+    return (
+        os.getenv("LIARA_AI_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or DEFAULT_LIARA_BASE_URL
+    ).strip()
+
+
+def _get_ai_model() -> str:
+    return (os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL).strip()
+
+
+def _get_ai_timeout_seconds() -> float:
+    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "1.4").strip()
+    try:
+        timeout = float(raw)
+    except Exception:  # noqa: BLE001
+        timeout = 1.4
+    return min(max(timeout, 0.8), 5.0)
+
+
+def _get_ai_client() -> OpenAI | None:
+    api_key = _get_ai_api_key()
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=_get_ai_timeout_seconds())
+
+
+
+
+DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
+
+
+@lru_cache(maxsize=1)
+def _load_prompt_contract_text() -> str:
+    path = DOCS_DIR / "prompt_contract_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load prompt contract %s error=%s", path, exc)
+        return ""
+    marker = "## System Contract"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
+
+
+@lru_cache(maxsize=1)
+def _load_tone_bible_excerpt() -> str:
+    path = DOCS_DIR / "tone_system_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load tone bible %s error=%s", path, exc)
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("-"):
+            lines.append(line.lstrip("- "))
+        if len(lines) >= 6:
+            break
+    return " | ".join(lines)
+
+@lru_cache(maxsize=1)
+def _load_onboarding_questions() -> list[tuple[str, str]]:
+    path = DOCS_DIR / "partner_identity_onboarding_v1.md"
+    defaults = [
+        ("nickname", "راستی… دوست داری چی صدات کنم؟"),
+        ("reply_length_pref", "جوابام کوتاه باشه یا معمولی بهتره برات؟"),
+        ("active_time_pattern", "بیشتر شبا حال داری حرف بزنی یا روزا؟"),
+        ("tone_preference", "من چجوری بهترم؟ آروم؟ شوخ ملایم؟ کم‌حرف؟"),
+        ("intimacy_tolerance", "رابطمون چقدر صمیمی باشه؟ کم، معمولی، زیاد؟"),
+    ]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load onboarding doc %s error=%s", path, exc)
+        return defaults
+
+    parsed: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- متن:"):
+            q = line.split(":", 1)[1].strip().replace("“", "").replace("”", "")
+            if q:
+                parsed.append(q)
+    if len(parsed) < 5:
+        return defaults
+    keys = ["nickname", "reply_length_pref", "active_time_pattern", "tone_preference", "intimacy_tolerance"]
+    return list(zip(keys, parsed[:5]))
+
+
+def _ensure_state(user: User, bot: Bot) -> BotUserState:
+    state, _ = BotUserState.objects.get_or_create(bot=bot, user=user)
+    return state
+
+
+def _onboarding_state(state: BotUserState) -> dict[str, Any]:
+    rules = dict(state.style_rules or {})
+    data = dict(rules.get("onboarding_v1") or {})
+    data.setdefault("answers", {})
+    data.setdefault("asked_count", 0)
+    return data
+
+
+def _save_onboarding_state(state: BotUserState, data: dict[str, Any]) -> None:
+    rules = dict(state.style_rules or {})
+    rules["onboarding_v1"] = data
+    BotUserState.objects.filter(id=state.id).update(style_rules=rules, updated_at=timezone.now())
+    state.style_rules = rules
+
+
+def _maybe_progress_onboarding(user: User, conversation: Conversation, normalized: str) -> list[dict[str, Any]]:
+    state = _ensure_state(user, conversation.bot)
+    flow = _onboarding_state(state)
+    questions = _load_onboarding_questions()
+    answers: dict[str, str] = flow.get("answers", {})
+    pending_key = flow.get("pending_key")
+
+    if pending_key and normalized:
+        answers[pending_key] = normalized[:120]
+        flow["answers"] = answers
+        flow["pending_key"] = ""
+
+    if len(answers) >= 5 and not flow.get("completed"):
+        partner_profile = {
+            "name": conversation.bot.display_name,
+            "tone": answers.get("tone_preference", "آروم"),
+            "intimacy": answers.get("intimacy_tolerance", "معمولی"),
+            "reply_length_pref": answers.get("reply_length_pref", "معمولی"),
+            "active_time_pattern": answers.get("active_time_pattern", "شب"),
+            "nickname": answers.get("nickname", ""),
+        }
+        relationship = dict(state.relationship_memory or {})
+        relationship["partner_profile_v1"] = partner_profile
+        BotUserState.objects.filter(id=state.id).update(relationship_memory=relationship, updated_at=timezone.now())
+        state.relationship_memory = relationship
+        flow["completed"] = True
+        _save_onboarding_state(state, flow)
+        return [_reply_payload("خوبه. کم‌کم داریم با vibe هم آشنا می‌شیم.")]
+
+    if flow.get("completed"):
+        _save_onboarding_state(state, flow)
+        return []
+
+    msg_count = state.total_user_messages
+    thresholds = [1, 3, 6, 10, 14]
+    asked_count = int(flow.get("asked_count", 0))
+    if asked_count >= len(questions):
+        _save_onboarding_state(state, flow)
+        return []
+
+    should_ask = msg_count >= thresholds[asked_count]
+    if not should_ask:
+        _save_onboarding_state(state, flow)
+        return []
+
+    key, question = questions[asked_count]
+    if key in answers:
+        flow["asked_count"] = asked_count + 1
+        _save_onboarding_state(state, flow)
+        return []
+
+    flow["pending_key"] = key
+    flow["asked_count"] = asked_count + 1
+    flow["last_asked_at"] = timezone.now().isoformat()
+    _save_onboarding_state(state, flow)
+    return [_reply_payload(question)]
 
 def _load_json(request):
     try:
@@ -174,14 +355,15 @@ def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
     }
     """
 
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY, using fallback bot traits")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY, using fallback bot traits")
         return {}
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     name_hint = user.first_name or user.telegram_username or "دوست"
     try:
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             temperature=0.9,
             max_tokens=180,
@@ -281,15 +463,16 @@ def _ensure_personal_bot(user: User) -> Bot | None:
     name_hint = user.first_name or user.telegram_username or "دوست"
     personal_prompt = template.base_prompt_text.strip() if template.base_prompt_text else ""
     personal_hint = (
-        f"این بات همراه اختصاصی {name_hint} است؛ لحن انسانی و خودمانی داشته باش، "
-        "گاهی یک اشاره کوتاه به حال و هوای خودت یا اینکه مشغول گوش دادن هستی بکن، "
-        "ولی داستان‌پردازی نکن."
+        f"این بات همراه اختصاصی {name_hint} است؛ مثل یک آدم واقعی و خودمونی حرف بزن، "
+        "مستقیم جواب بده و از لحن مشاوره‌ای یا پشتیبانی دوری کن؛ "
+        "داستان‌پردازی نکن."
     )
     if personal_prompt:
         personal_prompt = f"{personal_prompt}\n{personal_hint}"
     else:
         personal_prompt = (
-            "تو یک همراه گفت‌وگو و دوست شنوا هستی. کوتاه و صمیمی به فارسی پاسخ بده و خودت را ربات معرفی نکن. "
+            "تو یک آدم واقعی هستی، نه دستیار، نه مشاور، نه تراپیست و نه ربات پشتیبانی. "
+            "کاملاً محاوره‌ای، کوتاه و طبیعی مثل چت تلگرام حرف بزن و مستقیم جواب بده. "
             + personal_hint
         )
 
@@ -693,11 +876,11 @@ def _recent_user_texts(conversation: Conversation, limit: int = 20) -> list[str]
 
 
 def _typing_delay(text: str) -> float:
-    # Roughly model human typing rhythm; clamp to avoid long sleeps.
-    base = 0.4
-    per_char = 0.012
+    # Fast-reply mode: keep Telegram typing simulation minimal to hit sub-2s UX.
+    base = 0.05
+    per_char = 0.0015
     delay = base + len(text) * per_char
-    return max(0.35, min(delay, 2.2))
+    return max(0.04, min(delay, 0.22))
 
 
 def _split_reply(text: str, limit: int) -> list[str]:
@@ -836,14 +1019,29 @@ def _memory_fragments_instruction(state: BotUserState | None) -> str:
 
 
 def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
+    colloquial_guardrails = (
+        "تو یک آدم واقعی هستی، نه دستیار، نه مشاور، نه تراپیست و نه ربات پشتیبانی. "
+        "کاملاً محاوره‌ای، خودمونی و طبیعی مثل چت تلگرام بین دو دوست حرف بزن. "
+        "جمله‌ها کوتاه باشن. "
+        "هیچ لحن رسمی یا همدلانه مصنوعی نداشته باش. "
+        "ممنوعه که بگی «من اینجام گوش بدم»، «امیدوارم حالت بهتر شود»، «اگر خواستی بگو». "
+        "حرف انگیزشی یا مشاوره‌ای نزن. "
+        "ایموجی زیاد نذار. "
+        "توضیح مودبانه شبیه ربات نده. "
+        "مستقیم جواب بده. "
+        "لازم نیست همیشه مهربان یا حمایتی باشی. "
+        "مثل آدم واقعی واکنش بده و بعضی وقت‌ها کوتاه جواب بده. "
+        "طبیعی باش، نه بیش از حد مودب. "
+        "اگه چیزی نامفهوم بود بپرس: «منظورت دقیقاً چیه؟»."
+    )
+
     if not state and not identity:
         return (
-            "مثل یک دوست انسانی و شنوا حرف بزن؛ هیچ‌وقت خودت را ربات معرفی نکن و نشان بده همیشه وقت داری گوش بدهی. "
-            "کوتاه و دوستانه جواب بده؛ اگر question_budget=0 بود سؤال نپرس؛ "
-            "از نصیحت یا لحن درمانی دوری کن."
+            colloquial_guardrails
+            + " اگر question_budget=0 بود سؤال نپرس؛ از نصیحت یا لحن درمانی دوری کن."
         )
 
-    pieces: list[str] = []
+    pieces: list[str] = [colloquial_guardrails]
 
     if identity:
         tone_map = {
@@ -893,18 +1091,22 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
 
         closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
         if closeness_score < 0.2:
-            pieces.append("اعتماد پایین است؛ لحن رسمی و بدون فرضیات.")
+            pieces.append("اعتماد پایین است؛ باز هم خودمونی و خیلی ساده حرف بزن، فقط محتاط و بدون فرضیات.")
         elif closeness_score < 0.5:
-            pieces.append("اعتماد متوسط؛ دوستانه اما محتاط.")
+            pieces.append("اعتماد متوسط؛ خودمونی و دوستانه بمان، زیاده‌روی نکن.")
         else:
-            pieces.append("اعتماد بالا؛ می‌توانی کمی صمیمی‌تر باشی اما از نصیحت دوری کن.")
+            pieces.append("اعتماد بالا؛ راحت‌تر و صمیمی‌تر حرف بزن ولی از نصیحت دوری کن.")
 
         if state.style_rules:
             pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
 
+    tone_bible_hint = _load_tone_bible_excerpt()
+    if tone_bible_hint:
+        pieces.append(f"راهنمای لحن فریز شده: {tone_bible_hint}")
+
     pieces.append(
-        "لحن انسانی و خودمانی داشته باش؛ خودت را یک دوست در دسترس معرفی کن نه ربات؛ "
-        "نشان بده که گوش می‌دهی و عجله نداری."
+        "مثل آدم واقعی و خودمونی جواب بده؛ مستقیم برو سر اصل مطلب؛ "
+        "نه لحن رسمی، نه دل‌داری مصنوعی، نه توضیح اضافه."
     )
 
     return " ".join(pieces)
@@ -958,6 +1160,27 @@ def _question_policy_instructions(question_budget: int, budget_reason: str) -> s
     )
 
 
+def _normalize_colloquial_fa(reply_text: str) -> str:
+    if not reply_text:
+        return reply_text
+
+    replacements = {
+        "لاس کردن": "لاس زدن",
+        "لاس میکن": "لاس میزن",
+        "لاس می کن": "لاس می‌زن",
+        "جذاب میکنه": "جذاب میشه",
+        "جذاب می کنه": "جذاب میشه",
+        "اثر میکنه": "اثر میذاره",
+        "اثر می کنه": "اثر میذاره",
+    }
+
+    fixed = reply_text
+    for bad, good in replacements.items():
+        fixed = fixed.replace(bad, good)
+
+    return fixed
+
+
 def _apply_question_budget_to_reply(reply_text: str, question_budget: int) -> str:
     if question_budget > 0:
         return reply_text
@@ -994,8 +1217,8 @@ def _response_template_hint(
         template = "جمع‌بندی: دو نکته مهم را یادآوری کن و خداحافظی محترمانه داشته باش؛ سؤال نپرس."
     elif is_feeling and not is_question:
         template = (
-            "همدلی: یک جمله همدلانه و بازتاب احساس، یک یادآوری کوتاه که گوش می‌دهی، "
-            "و فقط در صورت ابهام جدی یک سؤال نرم."
+            "واکنش طبیعی: کوتاه و واقعی جواب بده، بدون دل‌داری یا جمله حمایتی کلیشه‌ای؛ "
+            "اگر لازم شد فقط یک سؤال کوتاه و مستقیم بپرس."
         )
     elif is_question:
         template = "راهنمایی/اطلاعاتی: بازتاب کوتاه، پاسخ روشن و کاربردی، و نهایتاً یک قدم بعدی خبری؛ "
@@ -1021,11 +1244,11 @@ def _build_llm_messages(
     mode_reason: str,
 ):
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
-    system_prompt = (
-        base_prompt
-        or "تو یک همراه گفت‌وگو و دوست شنوا هستی (نه یک ربات). با لحن طبیعی و انسانی به فارسی ساده پاسخ بده؛ "
-        "ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
-        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد و همیشه حس کن که در دسترس و کنار کاربر هستی."
+    contract_prompt = _load_prompt_contract_text()
+    system_prompt = base_prompt or contract_prompt or (
+        "تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه درمانگر. "
+        "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم. "
+        "ترکیب فعل‌ها و اصطلاحات رو درست و رایج به کار ببر (مثلاً «لاس زدن»، «جذاب میشه»)."
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
@@ -1063,11 +1286,12 @@ def _build_llm_messages(
 
 
 def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY")
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
     mode, mode_reason = _decide_conversation_mode(normalized_user_text)
     question_budget, budget_reason = _question_budget_decision(normalized_user_text)
@@ -1100,7 +1324,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     started = time.monotonic()
     try:
         max_tokens = min(768, bot.max_output_chars * 3)
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             messages=prompt_messages,
             temperature=0.6,
@@ -1110,9 +1334,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         usage = getattr(response, "usage", None)
         token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
         token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
-        reply_text = _apply_question_budget_to_reply(
-            (response.choices[0].message.content or "").strip(), question_budget
-        )
+        raw_text = (response.choices[0].message.content or "").strip()
+        normalized_text = _normalize_colloquial_fa(raw_text)
+        reply_text = _apply_question_budget_to_reply(normalized_text, question_budget)
         if not reply_text:
             return None
 
@@ -1129,7 +1353,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.latency_ms = latency_ms
         log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
         logger.exception(
-            "telegram_webhook: openai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+            "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
         )
         return None
 
@@ -1216,13 +1440,20 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
 
     # Regular chat flow
     _record_user_message(conversation, text, message_meta)
+
+    onboarding_replies = _maybe_progress_onboarding(user, conversation, normalized)
+    if onboarding_replies:
+        for item in onboarding_replies:
+            _record_bot_message(conversation, item.get("text", ""))
+        return onboarding_replies
+
     wallet = ensure_wallet(user)
     if wallet.balance <= 0:
         return _paywall_replies()
 
     generation = _generate_ai_reply(conversation, bot, normalized)
     if not generation:
-        bot_reply = _record_bot_message(conversation, "فعلاً نمی‌تونم جواب بدم. کمی بعد دوباره امتحان کن.")
+        bot_reply = _record_bot_message(conversation, "الان یکم کند شد؛ سریع دوباره بگو.")
         return [_reply_payload(bot_reply.text)]
 
     reply_limit = max(bot.max_output_chars, 500)
