@@ -105,9 +105,9 @@ def _load_tone_bible_excerpt() -> str:
 def _load_onboarding_questions() -> list[tuple[str, str]]:
     path = DOCS_DIR / "partner_identity_onboarding_v1.md"
     defaults = [
-        ("nickname", "راستی… دوست داری چی صدات کنم؟"),
-        ("reply_length_pref", "جواب کوتاه دوست داری یا معمولی بهتره؟"),
-        ("active_time_pattern", "بیشتر شبا حالی، یا روزا؟"),
+        ("nickname", "راستی… دوست داری چی صدام کنی؟"),
+        ("reply_length_pref", "جوابام کوتاه باشه یا معمولی بهتره برات؟"),
+        ("active_time_pattern", "بیشتر شبا حال داری حرف بزنی یا روزا؟"),
         ("tone_preference", "من چجوری بهترم؟ آروم؟ شوخ ملایم؟ کم‌حرف؟"),
         ("intimacy_tolerance", "رابطمون چقدر صمیمی باشه؟ کم، معمولی، زیاد؟"),
     ]
@@ -1151,6 +1151,27 @@ def _question_policy_instructions(question_budget: int, budget_reason: str) -> s
     )
 
 
+def _normalize_colloquial_fa(reply_text: str) -> str:
+    if not reply_text:
+        return reply_text
+
+    replacements = {
+        "لاس کردن": "لاس زدن",
+        "لاس میکن": "لاس میزن",
+        "لاس می کن": "لاس می‌زن",
+        "جذاب میکنه": "جذاب میشه",
+        "جذاب می کنه": "جذاب میشه",
+        "اثر میکنه": "اثر میذاره",
+        "اثر می کنه": "اثر میذاره",
+    }
+
+    fixed = reply_text
+    for bad, good in replacements.items():
+        fixed = fixed.replace(bad, good)
+
+    return fixed
+
+
 def _apply_question_budget_to_reply(reply_text: str, question_budget: int) -> str:
     if question_budget > 0:
         return reply_text
@@ -1217,7 +1238,8 @@ def _build_llm_messages(
     contract_prompt = _load_prompt_contract_text()
     system_prompt = base_prompt or contract_prompt or (
         "تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه درمانگر. "
-        "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم."
+        "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم. "
+        "ترکیب فعل‌ها و اصطلاحات رو درست و رایج به کار ببر (مثلاً «لاس زدن»، «جذاب میشه»)."
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
@@ -1303,9 +1325,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         usage = getattr(response, "usage", None)
         token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
         token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
-        reply_text = _apply_question_budget_to_reply(
-            (response.choices[0].message.content or "").strip(), question_budget
-        )
+        raw_text = (response.choices[0].message.content or "").strip()
+        normalized_text = _normalize_colloquial_fa(raw_text)
+        reply_text = _apply_question_budget_to_reply(normalized_text, question_budget)
         if not reply_text:
             return None
 
