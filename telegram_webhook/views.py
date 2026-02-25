@@ -32,7 +32,33 @@ class Intent:
 
 
 logger = logging.getLogger(__name__)
-openai_client = OpenAI()
+
+
+DEFAULT_LIARA_BASE_URL = "https://ai.liara.ir/api/699f21b89537b64832e9b9fa/v1"
+DEFAULT_LIARA_MODEL = "x-ai/grok-3-mini-beta"
+
+
+def _get_ai_api_key() -> str:
+    return (os.getenv("LIARA_AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+
+
+def _get_ai_base_url() -> str:
+    return (
+        os.getenv("LIARA_AI_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or DEFAULT_LIARA_BASE_URL
+    ).strip()
+
+
+def _get_ai_model() -> str:
+    return (os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL).strip()
+
+
+def _get_ai_client() -> OpenAI | None:
+    api_key = _get_ai_api_key()
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url())
 
 
 def _load_json(request):
@@ -174,14 +200,15 @@ def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
     }
     """
 
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY, using fallback bot traits")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY, using fallback bot traits")
         return {}
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     name_hint = user.first_name or user.telegram_username or "دوست"
     try:
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             temperature=0.9,
             max_tokens=180,
@@ -1023,9 +1050,9 @@ def _build_llm_messages(
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     system_prompt = (
         base_prompt
-        or "تو یک همراه گفت‌وگو و دوست شنوا هستی (نه یک ربات). با لحن طبیعی و انسانی به فارسی ساده پاسخ بده؛ "
-        "ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو و بعد جواب روشن و مشخص بده. "
-        "پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد و همیشه حس کن که در دسترس و کنار کاربر هستی."
+        or "تو یک همراه گفت‌وگو و دوست شنوا هستی (نه یک ربات). با لحن کاملاً عامیانه، خودمونی و طبیعی فارسی جواب بده؛ "
+        "جوری حرف بزن که انگار داری با یه دوست صمیمی چت می‌کنی. ابتدا یک جمله کوتاه برای بازتاب حرف یا حال کاربر بگو "
+        "و بعد جواب روشن و مشخص بده. پرسش فقط وقتی مجاز است که ابهام مانع پاسخ عملی باشد و همیشه حس کن که در دسترس و کنار کاربر هستی."
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
@@ -1063,11 +1090,12 @@ def _build_llm_messages(
 
 
 def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.warning("telegram_webhook: missing OPENAI_API_KEY")
+    ai_client = _get_ai_client()
+    if not ai_client:
+        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY")
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _get_ai_model()
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
     mode, mode_reason = _decide_conversation_mode(normalized_user_text)
     question_budget, budget_reason = _question_budget_decision(normalized_user_text)
@@ -1100,7 +1128,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     started = time.monotonic()
     try:
         max_tokens = min(768, bot.max_output_chars * 3)
-        response = openai_client.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model=model,
             messages=prompt_messages,
             temperature=0.6,
@@ -1129,7 +1157,7 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.latency_ms = latency_ms
         log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
         logger.exception(
-            "telegram_webhook: openai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+            "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
         )
         return None
 
