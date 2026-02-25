@@ -105,7 +105,7 @@ def _load_tone_bible_excerpt() -> str:
 def _load_onboarding_questions() -> list[tuple[str, str]]:
     path = DOCS_DIR / "partner_identity_onboarding_v1.md"
     defaults = [
-        ("nickname", "راستی… دوست داری چی صدات کنم؟"),
+        ("nickname", "راستی… دوست داری چی صدام کنی؟"),
         ("reply_length_pref", "جوابام کوتاه باشه یا معمولی بهتره برات؟"),
         ("active_time_pattern", "بیشتر شبا حال داری حرف بزنی یا روزا؟"),
         ("tone_preference", "من چجوری بهترم؟ آروم؟ شوخ ملایم؟ کم‌حرف؟"),
