@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from datetime import datetime
@@ -60,6 +62,150 @@ def _get_ai_client() -> OpenAI | None:
         return None
     return OpenAI(api_key=api_key, base_url=_get_ai_base_url())
 
+
+
+
+DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
+
+
+@lru_cache(maxsize=1)
+def _load_prompt_contract_text() -> str:
+    path = DOCS_DIR / "prompt_contract_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load prompt contract %s error=%s", path, exc)
+        return ""
+    marker = "## System Contract"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
+
+
+@lru_cache(maxsize=1)
+def _load_tone_bible_excerpt() -> str:
+    path = DOCS_DIR / "tone_system_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load tone bible %s error=%s", path, exc)
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("-"):
+            lines.append(line.lstrip("- "))
+        if len(lines) >= 6:
+            break
+    return " | ".join(lines)
+
+@lru_cache(maxsize=1)
+def _load_onboarding_questions() -> list[tuple[str, str]]:
+    path = DOCS_DIR / "partner_identity_onboarding_v1.md"
+    defaults = [
+        ("nickname", "راستی… دوست داری چی صدات کنم؟"),
+        ("reply_length_pref", "جواب کوتاه دوست داری یا معمولی بهتره؟"),
+        ("active_time_pattern", "بیشتر شبا حالی، یا روزا؟"),
+        ("tone_preference", "من چجوری بهترم؟ آروم؟ شوخ ملایم؟ کم‌حرف؟"),
+        ("intimacy_tolerance", "رابطمون چقدر صمیمی باشه؟ کم، معمولی، زیاد؟"),
+    ]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load onboarding doc %s error=%s", path, exc)
+        return defaults
+
+    parsed: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- متن:"):
+            q = line.split(":", 1)[1].strip().replace("“", "").replace("”", "")
+            if q:
+                parsed.append(q)
+    if len(parsed) < 5:
+        return defaults
+    keys = ["nickname", "reply_length_pref", "active_time_pattern", "tone_preference", "intimacy_tolerance"]
+    return list(zip(keys, parsed[:5]))
+
+
+def _ensure_state(user: User, bot: Bot) -> BotUserState:
+    state, _ = BotUserState.objects.get_or_create(bot=bot, user=user)
+    return state
+
+
+def _onboarding_state(state: BotUserState) -> dict[str, Any]:
+    rules = dict(state.style_rules or {})
+    data = dict(rules.get("onboarding_v1") or {})
+    data.setdefault("answers", {})
+    data.setdefault("asked_count", 0)
+    return data
+
+
+def _save_onboarding_state(state: BotUserState, data: dict[str, Any]) -> None:
+    rules = dict(state.style_rules or {})
+    rules["onboarding_v1"] = data
+    BotUserState.objects.filter(id=state.id).update(style_rules=rules, updated_at=timezone.now())
+    state.style_rules = rules
+
+
+def _maybe_progress_onboarding(user: User, conversation: Conversation, normalized: str) -> list[dict[str, Any]]:
+    state = _ensure_state(user, conversation.bot)
+    flow = _onboarding_state(state)
+    questions = _load_onboarding_questions()
+    answers: dict[str, str] = flow.get("answers", {})
+    pending_key = flow.get("pending_key")
+
+    if pending_key and normalized:
+        answers[pending_key] = normalized[:120]
+        flow["answers"] = answers
+        flow["pending_key"] = ""
+
+    if len(answers) >= 5 and not flow.get("completed"):
+        partner_profile = {
+            "name": conversation.bot.display_name,
+            "tone": answers.get("tone_preference", "آروم"),
+            "intimacy": answers.get("intimacy_tolerance", "معمولی"),
+            "reply_length_pref": answers.get("reply_length_pref", "معمولی"),
+            "active_time_pattern": answers.get("active_time_pattern", "شب"),
+            "nickname": answers.get("nickname", ""),
+        }
+        relationship = dict(state.relationship_memory or {})
+        relationship["partner_profile_v1"] = partner_profile
+        BotUserState.objects.filter(id=state.id).update(relationship_memory=relationship, updated_at=timezone.now())
+        state.relationship_memory = relationship
+        flow["completed"] = True
+        _save_onboarding_state(state, flow)
+        return [_reply_payload("خوبه. کم‌کم داریم با vibe هم آشنا می‌شیم.")]
+
+    if flow.get("completed"):
+        _save_onboarding_state(state, flow)
+        return []
+
+    msg_count = state.total_user_messages
+    thresholds = [1, 3, 6, 10, 14]
+    asked_count = int(flow.get("asked_count", 0))
+    if asked_count >= len(questions):
+        _save_onboarding_state(state, flow)
+        return []
+
+    should_ask = msg_count >= thresholds[asked_count]
+    if not should_ask:
+        _save_onboarding_state(state, flow)
+        return []
+
+    key, question = questions[asked_count]
+    if key in answers:
+        flow["asked_count"] = asked_count + 1
+        _save_onboarding_state(state, flow)
+        return []
+
+    flow["pending_key"] = key
+    flow["asked_count"] = asked_count + 1
+    flow["last_asked_at"] = timezone.now().isoformat()
+    _save_onboarding_state(state, flow)
+    return [_reply_payload(question)]
 
 def _load_json(request):
     try:
@@ -945,6 +1091,10 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
         if state.style_rules:
             pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
 
+    tone_bible_hint = _load_tone_bible_excerpt()
+    if tone_bible_hint:
+        pieces.append(f"راهنمای لحن فریز شده: {tone_bible_hint}")
+
     pieces.append(
         "مثل آدم واقعی و خودمونی جواب بده؛ مستقیم برو سر اصل مطلب؛ "
         "نه لحن رسمی، نه دل‌داری مصنوعی، نه توضیح اضافه."
@@ -1063,43 +1213,12 @@ def _build_llm_messages(
     mode: str,
     mode_reason: str,
 ):
-    system_prompt = """تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه همدل حرفه‌ای.
-
-قانون اصلی:
-مثل یک دوست معمولی جواب بده، نه کسی که می‌خواهد حال طرف را بهتر کند.
-
-سبک صحبت:
-کاملاً محاوره‌ای فارسی.
-جمله‌ها کوتاه.
-گاهی خیلی کوتاه جواب بده.
-لازم نیست همیشه حرف قشنگ بزنی.
-
-ممنوع:
-- جملات کلیشه‌ای همدلی
-- نصیحت
-- حرف انگیزشی
-- دیالوگ شبیه روانشناس
-- جمله‌های آماده مثل:
-  «می‌فهمم چه حسی داری»
-  «اگر دوست داشتی بگو»
-  «امیدوارم حالت بهتر شود»
-  «من اینجام گوش بدم»
-  مثال‌های شاعرانه مثل چای، باران، نور امید و ...
-
-رفتار طبیعی:
-اگر کاربر ناراحت بود:
-اول واکنش انسانی بده، بعد سوال ساده بپرس.
-
-نمونه درست:
-
-کاربر: دلم گرفته
-تو: چرا؟ چی شده؟
-
-کاربر: اوضاع کشور داغونه
-تو: آره آدم واقعاً کلافه میشه از این خبرها.
-
-کاربر: یه حرف خوب بزن
-تو: راستش الان حرف قشنگ بلد نیستم بگم، ولی تنها نیستی تو این حس."""
+    base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
+    contract_prompt = _load_prompt_contract_text()
+    system_prompt = base_prompt or contract_prompt or (
+        "تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه درمانگر. "
+        "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم."
+    )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
     mode_hint = _mode_instruction(mode)
@@ -1290,6 +1409,13 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
 
     # Regular chat flow
     _record_user_message(conversation, text, message_meta)
+
+    onboarding_replies = _maybe_progress_onboarding(user, conversation, normalized)
+    if onboarding_replies:
+        for item in onboarding_replies:
+            _record_bot_message(conversation, item.get("text", ""))
+        return onboarding_replies
+
     wallet = ensure_wallet(user)
     if wallet.balance <= 0:
         return _paywall_replies()
