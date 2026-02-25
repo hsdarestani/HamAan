@@ -65,6 +65,20 @@ def _get_ai_timeout_seconds() -> float:
     return min(max(timeout, 0.8), 5.0)
 
 
+
+
+def _looks_like_timeout_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if any(token in msg for token in ["timeout", "timed out", "readtimeout", "api timeout"]):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    while cause:
+        cmsg = str(cause).lower()
+        if any(token in cmsg for token in ["timeout", "timed out", "readtimeout", "api timeout"]):
+            return True
+        cause = getattr(cause, "__cause__", None)
+    return False
+
 def _get_ai_client() -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
@@ -1380,13 +1394,22 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     except Exception as exc:  # noqa: BLE001
         latency_ms = int((time.monotonic() - started) * 1000)
         fallback_text = _quick_fallback_reply(normalized_user_text)
+        is_timeout = _looks_like_timeout_error(exc)
         log.status = LLMCallLog.Status.ERROR
-        log.error_message = str(exc)[:255]
+        log.error_message = (f"timeout:{exc}" if is_timeout else str(exc))[:255]
         log.latency_ms = latency_ms
         log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
-        logger.exception(
-            "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
-        )
+        if is_timeout:
+            logger.warning(
+                "telegram_webhook: ai timeout(fallback) conversation=%s bot=%s latency_ms=%s",
+                conversation.id,
+                bot.id,
+                latency_ms,
+            )
+        else:
+            logger.exception(
+                "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+            )
         return {"text": fallback_text, "token_in": 0, "token_out": 0}
 
 
