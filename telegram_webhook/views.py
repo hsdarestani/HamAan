@@ -57,14 +57,34 @@ def _get_ai_model() -> str:
 
 
 def _get_ai_timeout_seconds() -> float:
-    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "8").strip()
+    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "2").strip()
     try:
         timeout = float(raw)
     except Exception:  # noqa: BLE001
-        timeout = 8.0
-    return min(max(timeout, 1.0), 30.0)
+        timeout = 2.0
+    return min(max(timeout, 0.6), 10.0)
 
 
+def _get_ai_retry_timeout_seconds() -> float:
+    raw = (os.getenv("AI_REPLY_RETRY_TIMEOUT_SECONDS") or "4").strip()
+    try:
+        timeout = float(raw)
+    except Exception:  # noqa: BLE001
+        timeout = 4.0
+    return min(max(timeout, 0.5), 12.0)
+
+
+def _get_ai_latency_budget_seconds() -> float:
+    raw = (os.getenv("AI_REPLY_TOTAL_BUDGET_SECONDS") or "2").strip()
+    try:
+        budget = float(raw)
+    except Exception:  # noqa: BLE001
+        budget = 2.0
+    return min(max(budget, 1.0), 5.0)
+
+
+def _is_ai_timeout_retry_enabled() -> bool:
+    return _env_flag("AI_TIMEOUT_RETRY_ENABLED", default=False)
 
 
 def _looks_like_timeout_error(exc: Exception) -> bool:
@@ -87,11 +107,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return default
     return raw in {"1", "true", "yes", "on"}
 
-def _get_ai_client() -> OpenAI | None:
+def _get_ai_client(timeout_seconds: float | None = None) -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
         return None
-    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=_get_ai_timeout_seconds(), max_retries=0)
+    timeout = timeout_seconds if timeout_seconds is not None else _get_ai_timeout_seconds()
+    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=timeout, max_retries=0)
 
 
 
@@ -1325,7 +1346,11 @@ def _build_llm_messages(
 
 
 def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
-    ai_client = _get_ai_client()
+    started = time.monotonic()
+    latency_budget_seconds = _get_ai_latency_budget_seconds()
+    timeout_seconds = min(_get_ai_timeout_seconds(), latency_budget_seconds)
+    retry_enabled = _is_ai_timeout_retry_enabled()
+    ai_client = _get_ai_client(timeout_seconds=timeout_seconds)
     if not ai_client:
         logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY")
         return None
@@ -1360,7 +1385,16 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
             "mode_reason": mode_reason,
         },
     )
-    started = time.monotonic()
+    logger.info(
+        "telegram_webhook: ai start conversation=%s bot=%s model=%s timeout_s=%.2f budget_s=%.2f retry_enabled=%s user_text_len=%s",
+        conversation.id,
+        bot.id,
+        model,
+        timeout_seconds,
+        latency_budget_seconds,
+        retry_enabled,
+        len(normalized_user_text or ""),
+    )
     try:
         max_tokens = min(160, max(64, bot.max_output_chars // 2))
         response = ai_client.chat.completions.create(
@@ -1384,19 +1418,97 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.token_out = token_out
         log.request_id = getattr(response, "id", "")
         log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
-        return {"text": reply_text, "token_in": token_in, "token_out": token_out}
-    except APITimeoutError as exc:
-        latency_ms = int((time.monotonic() - started) * 1000)
-        fallback_text = _quick_fallback_reply(normalized_user_text)
-        log.status = LLMCallLog.Status.ERROR
-        log.error_message = f"timeout:{str(exc)}"[:255]
-        log.latency_ms = latency_ms
-        log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
-        logger.warning(
-            "telegram_webhook: ai timeout conversation=%s bot=%s latency_ms=%s -> fallback",
+        logger.info(
+            "telegram_webhook: ai success conversation=%s bot=%s latency_ms=%s token_in=%s token_out=%s",
             conversation.id,
             bot.id,
             latency_ms,
+            token_in,
+            token_out,
+        )
+        return {"text": reply_text, "token_in": token_in, "token_out": token_out}
+    except APITimeoutError as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        elapsed_seconds = time.monotonic() - started
+        remaining_budget = max(0.0, latency_budget_seconds - elapsed_seconds)
+        logger.warning(
+            "telegram_webhook: ai timeout conversation=%s bot=%s latency_ms=%s timeout_s=%.2f budget_s=%.2f remaining_s=%.2f error=%s",
+            conversation.id,
+            bot.id,
+            latency_ms,
+            timeout_seconds,
+            latency_budget_seconds,
+            remaining_budget,
+            exc,
+        )
+
+        if retry_enabled and remaining_budget >= 0.35:
+            retry_timeout = min(_get_ai_retry_timeout_seconds(), remaining_budget)
+            retry_client = _get_ai_client(timeout_seconds=retry_timeout)
+            if retry_client:
+                retry_started = time.monotonic()
+                try:
+                    retry_max_tokens = min(max_tokens, 72)
+                    logger.info(
+                        "telegram_webhook: ai retry start conversation=%s bot=%s retry_timeout_s=%.2f retry_max_tokens=%s",
+                        conversation.id,
+                        bot.id,
+                        retry_timeout,
+                        retry_max_tokens,
+                    )
+                    retry_response = retry_client.chat.completions.create(
+                        model=model,
+                        messages=prompt_messages,
+                        temperature=0.6,
+                        max_tokens=retry_max_tokens,
+                    )
+                    retry_latency_ms = int((time.monotonic() - retry_started) * 1000)
+                    usage = getattr(retry_response, "usage", None)
+                    token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
+                    token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
+                    raw_text = (retry_response.choices[0].message.content or "").strip()
+                    normalized_text = _normalize_colloquial_fa(raw_text)
+                    reply_text = _apply_question_budget_to_reply(normalized_text, question_budget)
+                    if reply_text:
+                        log.latency_ms = int((time.monotonic() - started) * 1000)
+                        log.token_in = token_in
+                        log.token_out = token_out
+                        log.request_id = getattr(retry_response, "id", "")
+                        log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
+                        logger.info(
+                            "telegram_webhook: ai retry success conversation=%s bot=%s total_latency_ms=%s token_in=%s token_out=%s",
+                            conversation.id,
+                            bot.id,
+                            log.latency_ms,
+                            token_in,
+                            token_out,
+                        )
+                        return {"text": reply_text, "token_in": token_in, "token_out": token_out}
+                    logger.warning(
+                        "telegram_webhook: ai retry empty-reply conversation=%s bot=%s retry_latency_ms=%s",
+                        conversation.id,
+                        bot.id,
+                        retry_latency_ms,
+                    )
+                except Exception as retry_exc:  # noqa: BLE001
+                    logger.warning(
+                        "telegram_webhook: ai retry failed conversation=%s bot=%s error=%s",
+                        conversation.id,
+                        bot.id,
+                        retry_exc,
+                    )
+
+        fallback_text = _quick_fallback_reply(normalized_user_text)
+        log.status = LLMCallLog.Status.ERROR
+        log.error_message = f"timeout:{str(exc)}"[:255]
+        log.latency_ms = int((time.monotonic() - started) * 1000)
+        log.save(update_fields=["status", "error_message", "latency_ms", "updated_at"])
+        logger.warning(
+            "telegram_webhook: ai fallback conversation=%s bot=%s latency_ms=%s reason=timeout retry_enabled=%s",
+            conversation.id,
+            bot.id,
+            log.latency_ms,
+            retry_enabled,
         )
         return {"text": fallback_text, "token_in": 0, "token_out": 0}
     except Exception as exc:  # noqa: BLE001
@@ -1662,6 +1774,9 @@ def TelegramWebhookDiagnosticsView(request):
             "ai_base_url": _get_ai_base_url(),
             "ai_model": _get_ai_model(),
             "ai_timeout_seconds": _get_ai_timeout_seconds(),
+            "ai_retry_timeout_seconds": _get_ai_retry_timeout_seconds(),
+            "ai_total_budget_seconds": _get_ai_latency_budget_seconds(),
+            "ai_timeout_retry_enabled": _is_ai_timeout_retry_enabled(),
             "environment": os.getenv("ENVIRONMENT", "dev"),
         }
     )
