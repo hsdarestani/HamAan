@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,38 @@ def _get_ai_client(timeout_seconds: float | None = None) -> OpenAI | None:
     return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=timeout, max_retries=0)
 
 
+@lru_cache(maxsize=1)
+def _get_ai_executor() -> ThreadPoolExecutor:
+    workers_raw = (os.getenv("AI_EXECUTOR_MAX_WORKERS") or "8").strip()
+    try:
+        workers = int(workers_raw)
+    except Exception:  # noqa: BLE001
+        workers = 8
+    workers = min(max(workers, 2), 32)
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai-call")
+
+
+def _call_ai_with_deadline(ai_client: OpenAI, *, timeout_seconds: float, **kwargs):
+    started = time.monotonic()
+    future = _get_ai_executor().submit(ai_client.chat.completions.create, timeout=timeout_seconds, **kwargs)
+    try:
+        response = future.result(timeout=max(0.2, timeout_seconds + 0.2))
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "telegram_webhook: ai transport done elapsed_ms=%s configured_timeout_s=%.2f",
+            elapsed_ms,
+            timeout_seconds,
+        )
+        return response
+    except FuturesTimeoutError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        future.cancel()
+        logger.warning(
+            "telegram_webhook: ai hard-deadline-hit elapsed_ms=%s configured_timeout_s=%.2f",
+            elapsed_ms,
+            timeout_seconds,
+        )
+        raise APITimeoutError(f"app_deadline_exceeded:{timeout_seconds}s") from exc
 
 
 DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
@@ -1397,7 +1430,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     )
     try:
         max_tokens = min(160, max(64, bot.max_output_chars // 2))
-        response = ai_client.chat.completions.create(
+        response = _call_ai_with_deadline(
+            ai_client,
+            timeout_seconds=timeout_seconds,
             model=model,
             messages=prompt_messages,
             temperature=0.6,
@@ -1432,13 +1467,14 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         elapsed_seconds = time.monotonic() - started
         remaining_budget = max(0.0, latency_budget_seconds - elapsed_seconds)
         logger.warning(
-            "telegram_webhook: ai timeout conversation=%s bot=%s latency_ms=%s timeout_s=%.2f budget_s=%.2f remaining_s=%.2f error=%s",
+            "telegram_webhook: ai timeout conversation=%s bot=%s latency_ms=%s timeout_s=%.2f budget_s=%.2f remaining_s=%.2f retry_enabled=%s error=%s",
             conversation.id,
             bot.id,
             latency_ms,
             timeout_seconds,
             latency_budget_seconds,
             remaining_budget,
+            retry_enabled,
             exc,
         )
 
@@ -1456,7 +1492,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
                         retry_timeout,
                         retry_max_tokens,
                     )
-                    retry_response = retry_client.chat.completions.create(
+                    retry_response = _call_ai_with_deadline(
+                        retry_client,
+                        timeout_seconds=retry_timeout,
                         model=model,
                         messages=prompt_messages,
                         temperature=0.6,
