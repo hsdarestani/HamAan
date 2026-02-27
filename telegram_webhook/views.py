@@ -79,6 +79,14 @@ def _looks_like_timeout_error(exc: Exception) -> bool:
         cause = getattr(cause, "__cause__", None)
     return False
 
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
 def _get_ai_client() -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
@@ -1566,12 +1574,24 @@ def TelegramWebhookView(request):
     """
     secret = os.getenv("TELEGRAM_SECRET_TOKEN", "")
     got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    allow_missing_secret = _env_flag("TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False)
+
+    logger.warning(
+        "telegram_webhook: hit has_secret=%s header_present=%s allow_missing_secret=%s",
+        bool(secret),
+        bool(got),
+        allow_missing_secret,
+    )
 
     if secret and got != secret:
-        return HttpResponseForbidden("forbidden")
+        if allow_missing_secret and not got:
+            logger.warning("telegram_webhook: secret header missing but bypass is enabled")
+        else:
+            logger.error("telegram_webhook: forbidden secret mismatch")
+            return HttpResponseForbidden("forbidden")
 
     payload = _load_json(request)
-    logger.info("telegram_webhook: incoming payload keys=%s", list(payload.keys()))
+    logger.warning("telegram_webhook: incoming payload keys=%s", list(payload.keys()))
     text = _extract_text(payload)
     try:
         user = _touch_user(payload)
@@ -1581,7 +1601,11 @@ def TelegramWebhookView(request):
 
     bot = _resolve_user_bot(user)
 
-    replies = _handle_message(user, bot, text, payload)
+    try:
+        replies = _handle_message(user, bot, text, payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("telegram_webhook: unhandled error in _handle_message user=%s error=%s", user.id, exc)
+        replies = [_reply_payload("الان یه مشکلی پیش اومد، دوباره بفرست.")]
     chat = _extract_chat(payload)
     chat_id = chat.get("id")
     message_id = None
@@ -1633,6 +1657,11 @@ def TelegramWebhookDiagnosticsView(request):
     return JsonResponse(
         {
             "has_secret": bool(os.getenv("TELEGRAM_SECRET_TOKEN", "")),
+            "allow_missing_secret_header": _env_flag("TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False),
+            "telegram_bot_token_set": bool(os.getenv("TELEGRAM_BOT_TOKEN", "")),
+            "ai_base_url": _get_ai_base_url(),
+            "ai_model": _get_ai_model(),
+            "ai_timeout_seconds": _get_ai_timeout_seconds(),
             "environment": os.getenv("ENVIRONMENT", "dev"),
         }
     )
