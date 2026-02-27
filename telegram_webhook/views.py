@@ -155,6 +155,22 @@ def _load_prompt_contract_text() -> str:
     return text.strip()
 
 
+@lru_cache(maxsize=1)
+def _load_nsfw_activation_text() -> str:
+    """لود بخش NSFW از فایل docs/nsfw_activation_v1.md"""
+    path = DOCS_DIR / "nsfw_activation_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load nsfw_activation_v1.md error=%s", exc)
+        return ""
+
+    marker = "# NSFW Activation V1"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
 
 
 @lru_cache(maxsize=1)
@@ -984,6 +1000,40 @@ def _decide_conversation_mode(normalized_user_text: str) -> tuple[str, str]:
     return "answer", "پاسخ مستقیم بدون نیاز به سؤال"
 
 
+def _should_activate_nsfw(
+    state: BotUserState | None,
+    normalized_user_text: str,
+    recent_user_texts: list[str] | None = None,
+) -> bool:
+    """تشخیص اینکه آیا باید حالت NSFW فعال شود یا نه"""
+    if not state:
+        return False
+
+    # اولویت ۱: کاربر در onboarding گزینه "زیاد" را انتخاب کرده
+    rel = state.relationship_memory or {}
+    profile = rel.get("partner_profile_v1", {}) or {}
+    if profile.get("intimacy") == "زیاد":
+        return True
+
+    # اولویت ۲: وجود کلمات کلیدی سکسی در پیام فعلی یا ۸ پیام آخر کاربر
+    nsfw_keywords = {
+        "کیر", "کس", "کون", "کص", "کییر", "کوس", "گای", "گائیدن", "مکیدن",
+        "لیسیدن", "جیش", "حشری", "سکس", "سکسچت", "پورن", "ارضا", "آب کشیدن",
+        "نوک کیر", "تخم", "کلیتور", "دهنم", "کونم", "کیرمو", "لب بزن", "بخورم",
+    }
+
+    text_lower = (normalized_user_text or "").lower()
+    if any(kw in text_lower for kw in nsfw_keywords):
+        return True
+
+    if recent_user_texts:
+        for txt in recent_user_texts[-8:]:
+            if any(kw in (txt or "").lower() for kw in nsfw_keywords):
+                return True
+
+    return False
+
+
 def _mode_instruction(mode: str) -> str:
     if mode == "answer":
         return "mode=answer: فقط پاسخ بده، هیچ سؤالی نپرس و پیشنهاد را خبری بیان کن."
@@ -1352,6 +1402,12 @@ def _build_llm_messages(
         messages.append({"role": "system", "content": memory_hint})
     template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
     messages.append({"role": "system", "content": template_hint})
+    # ==================== NSFW ACTIVATION (V1) ====================
+    recent_user_texts = _recent_user_texts(conversation, limit=8)
+    nsfw_text = _load_nsfw_activation_text()
+    if nsfw_text and _should_activate_nsfw(state, normalized_user_text, recent_user_texts):
+        messages.append({"role": "system", "content": nsfw_text})
+    # ==================== END NSFW ====================
     summary = (conversation.memory_summary or "").strip()
     if summary:
         messages.append({"role": "system", "content": f"خلاصه گفت‌وگو تا اینجا: {summary}"})
