@@ -57,12 +57,12 @@ def _get_ai_model() -> str:
 
 
 def _get_ai_timeout_seconds() -> float:
-    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "1.4").strip()
+    raw = (os.getenv("AI_REPLY_TIMEOUT_SECONDS") or "8").strip()
     try:
         timeout = float(raw)
     except Exception:  # noqa: BLE001
-        timeout = 1.4
-    return min(max(timeout, 0.8), 5.0)
+        timeout = 8.0
+    return min(max(timeout, 1.0), 30.0)
 
 
 
