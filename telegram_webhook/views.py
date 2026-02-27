@@ -155,6 +155,22 @@ def _load_prompt_contract_text() -> str:
     return text.strip()
 
 
+@lru_cache(maxsize=1)
+def _load_nsfw_activation_text() -> str:
+    """لود بخش NSFW از فایل docs/nsfw_activation_v1.md"""
+    path = DOCS_DIR / "nsfw_activation_v1.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_webhook: unable to load nsfw_activation_v1.md error=%s", exc)
+        return ""
+
+    marker = "# NSFW Activation V1"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
 
 
 @lru_cache(maxsize=1)
@@ -984,14 +1000,48 @@ def _decide_conversation_mode(normalized_user_text: str) -> tuple[str, str]:
     return "answer", "پاسخ مستقیم بدون نیاز به سؤال"
 
 
+def _should_activate_nsfw(
+    state: BotUserState | None,
+    normalized_user_text: str,
+    recent_user_texts: list[str] | None = None,
+) -> bool:
+    """تشخیص اینکه آیا باید حالت NSFW فعال شود یا نه"""
+    if not state:
+        return False
+
+    # اولویت ۱: کاربر در onboarding گزینه "زیاد" را انتخاب کرده
+    rel = state.relationship_memory or {}
+    profile = rel.get("partner_profile_v1", {}) or {}
+    if profile.get("intimacy") == "زیاد":
+        return True
+
+    # اولویت ۲: وجود کلمات کلیدی سکسی در پیام فعلی یا ۸ پیام آخر کاربر
+    nsfw_keywords = {
+        "کیر", "کس", "کون", "کص", "کییر", "کوس", "گای", "گائیدن", "مکیدن",
+        "لیسیدن", "جیش", "حشری", "سکس", "سکسچت", "پورن", "ارضا", "آب کشیدن",
+        "نوک کیر", "تخم", "کلیتور", "دهنم", "کونم", "کیرمو", "لب بزن", "بخورم",
+    }
+
+    text_lower = (normalized_user_text or "").lower()
+    if any(kw in text_lower for kw in nsfw_keywords):
+        return True
+
+    if recent_user_texts:
+        for txt in recent_user_texts[-8:]:
+            if any(kw in (txt or "").lower() for kw in nsfw_keywords):
+                return True
+
+    return False
+
+
 def _mode_instruction(mode: str) -> str:
     if mode == "answer":
-        return "mode=answer: فقط پاسخ بده، هیچ سؤالی نپرس و پیشنهاد را خبری بیان کن."
+        return "mode=answer: راحت و خودمونی جواب بده؛ مستقیم برو سر اصل مطلب و سؤال نپرس."
     if mode == "clarify":
-        return "mode=clarify: اگر واقعاً نیاز بود فقط یک سؤال خیلی کوتاه بپرس؛ در غیر این صورت پاسخ مستقیم بده."
+        return "mode=clarify: اول تلاش کن بدون سؤال جواب بدی؛ فقط اگر ابهام جدی بود یک سؤال کوتاه و دقیق بپرس."
     if mode == "guide":
-        return "mode=guide: یک گزینه یا قدم بعدی خبری پیشنهاد بده و حداکثر یک سؤال کوتاه مجاز است."
-    return "mode=idle: پاسخ بسیار کوتاه و بدون سؤال."
+        return "mode=guide: راه‌حل رو ساده و کاربردی بگو و نهایتاً یک قدم بعدی کوتاه پیشنهاد بده."
+    return "mode=idle: خیلی کوتاه، طبیعی و بدون سؤال جمعش کن."
 
 
 def _identity_profile_instruction(identity: BotIdentity | None) -> str:
@@ -1216,11 +1266,11 @@ def _enforce_mode_on_budget(mode: str, question_budget: int, budget_reason: str,
 
 def _question_policy_instructions(question_budget: int, budget_reason: str) -> str:
     return (
-        f"question_budget={question_budget} (۰ یعنی هیچ سؤالی مجاز نیست؛ ۱ یعنی حداکثر یک سؤال کوتاه برای رفع ابهام). "
-        f"دلیل بودجه: {budget_reason}. "
-        "سه حالت خروجی داری: [A] پاسخ مستقیم بدون سؤال؛ [B] پاسخ + یک پیشنهاد اختیاری به صورت جمله خبری بدون علامت سؤال؛ "
-        "[C] فقط یک سؤال دقیق برای رفع ابهام، آن هم وقتی بدون آن نمی‌توانی پاسخ روشنی بدهی. همیشه A یا B را ترجیح بده مگر واقعاً ابهام مانع پاسخ باشد. "
-        "اگر question_budget=0 یا ابهام جدی نیست، هیچ علامت سؤال نگذار و حالت C را استفاده نکن."
+        f"question_budget={question_budget} (۰ یعنی سؤال نپرس؛ ۱ یعنی فقط یک سؤال کوتاه وقتی واقعاً لازم است). "
+        f"علت تصمیم: {budget_reason}. "
+        "اولویت با جواب مفید و طبیعی است: [A] پاسخ مستقیم بدون سؤال؛ [B] پاسخ مستقیم + یک پیشنهاد کوتاه خبری؛ "
+        "[C] یک سؤال شفاف فقط برای رفع ابهام واقعی. تا وقتی می‌شود با A یا B جلو برو، سمت C نرو. "
+        "اگر question_budget=0 بود یا ابهام جدی نبود، هیچ علامت سؤال نگذار."
     )
 
 
@@ -1295,22 +1345,22 @@ def _response_template_hint(
     followup_hint = "بدون سؤال" if question_budget == 0 else "سؤال فقط اگر ابهام واقعی داری"
 
     if has_closing:
-        template = "جمع‌بندی: دو نکته مهم را یادآوری کن و خداحافظی محترمانه داشته باش؛ سؤال نپرس."
+        template = "جمع‌بندی: کوتاه و گرم خداحافظی کن، یک نکته مفید یادآوری کن و سؤال نپرس."
     elif is_feeling and not is_question:
         template = (
-            "واکنش طبیعی: کوتاه و واقعی جواب بده، بدون دل‌داری یا جمله حمایتی کلیشه‌ای؛ "
+            "واکنش طبیعی: کوتاه، صمیمی و واقعی جواب بده؛ بدون جمله‌های کلیشه‌ای. "
             "اگر لازم شد فقط یک سؤال کوتاه و مستقیم بپرس."
         )
     elif is_question:
-        template = "راهنمایی/اطلاعاتی: بازتاب کوتاه، پاسخ روشن و کاربردی، و نهایتاً یک قدم بعدی خبری؛ "
+        template = "راهنمایی/اطلاعاتی: خیلی روشن و ساده جواب بده و اگر لازم بود یک قدم بعدی عملی پیشنهاد کن؛ "
         if question_budget == 1:
             template += "اگر جواب دقیق نیازمند داده بیشتر بود، یک سؤال مشخص بپرس."
     elif long_chat and not short_length:
-        template = "پیگیری: یادآوری کوتاه موضوع قبلی، یک پیشنهاد کوچک یا قدم بعدی خبری، و سؤال فقط اگر واقعاً لازم بود."
+        template = "پیگیری: طبیعی به حرف‌های قبلی وصل شو، یک پیشنهاد جمع‌وجور بده و بی‌دلیل سؤال نپرس."
     else:
-        template = f"اطلاعاتی: بازتاب کوتاه، پاسخ مستقیم، و {followup_hint}."
+        template = f"اطلاعاتی: خودمونی و مستقیم جواب بده، خلاصه و روشن؛ {followup_hint}."
 
-    return f"الگوی پاسخ پیشنهادی ({template})"
+    return f"راهنمای لحن پاسخ: {template}"
 
 
 def _build_llm_messages(
@@ -1352,6 +1402,12 @@ def _build_llm_messages(
         messages.append({"role": "system", "content": memory_hint})
     template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
     messages.append({"role": "system", "content": template_hint})
+    # ==================== NSFW ACTIVATION (V1) ====================
+    recent_user_texts = _recent_user_texts(conversation, limit=8)
+    nsfw_text = _load_nsfw_activation_text()
+    if nsfw_text and _should_activate_nsfw(state, normalized_user_text, recent_user_texts):
+        messages.append({"role": "system", "content": nsfw_text})
+    # ==================== END NSFW ====================
     summary = (conversation.memory_summary or "").strip()
     if summary:
         messages.append({"role": "system", "content": f"خلاصه گفت‌وگو تا اینجا: {summary}"})
