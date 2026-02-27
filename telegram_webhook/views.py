@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -63,7 +62,7 @@ def _get_ai_timeout_seconds() -> float:
         timeout = float(raw)
     except Exception:  # noqa: BLE001
         timeout = 2.0
-    return min(max(timeout, 0.6), 10.0)
+    return min(max(timeout, 0.6), 30.0)
 
 
 def _get_ai_retry_timeout_seconds() -> float:
@@ -116,22 +115,10 @@ def _get_ai_client(timeout_seconds: float | None = None) -> OpenAI | None:
     return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=timeout, max_retries=0)
 
 
-@lru_cache(maxsize=1)
-def _get_ai_executor() -> ThreadPoolExecutor:
-    workers_raw = (os.getenv("AI_EXECUTOR_MAX_WORKERS") or "8").strip()
-    try:
-        workers = int(workers_raw)
-    except Exception:  # noqa: BLE001
-        workers = 8
-    workers = min(max(workers, 2), 32)
-    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ai-call")
-
-
 def _call_ai_with_deadline(ai_client: OpenAI, *, timeout_seconds: float, **kwargs):
     started = time.monotonic()
-    future = _get_ai_executor().submit(ai_client.chat.completions.create, timeout=timeout_seconds, **kwargs)
     try:
-        response = future.result(timeout=max(0.2, timeout_seconds + 0.2))
+        response = ai_client.chat.completions.create(**kwargs)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "telegram_webhook: ai transport done elapsed_ms=%s configured_timeout_s=%.2f",
@@ -139,15 +126,16 @@ def _call_ai_with_deadline(ai_client: OpenAI, *, timeout_seconds: float, **kwarg
             timeout_seconds,
         )
         return response
-    except FuturesTimeoutError as exc:
+    except Exception as exc:  # noqa: BLE001
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        future.cancel()
         logger.warning(
-            "telegram_webhook: ai hard-deadline-hit elapsed_ms=%s configured_timeout_s=%.2f",
+            "telegram_webhook: ai transport error elapsed_ms=%s configured_timeout_s=%.2f exc_type=%s exc=%r",
             elapsed_ms,
             timeout_seconds,
+            type(exc).__name__,
+            exc,
         )
-        raise APITimeoutError(f"app_deadline_exceeded:{timeout_seconds}s") from exc
+        raise
 
 
 DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
