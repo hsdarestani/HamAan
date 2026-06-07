@@ -36,6 +36,33 @@ class Intent:
 logger = logging.getLogger(__name__)
 
 
+PARTNER_SETUP_KEY = "partner_setup_v1"
+PARTNER_SETUP_LOCKED_TEXT = (
+    "این انتخاب‌ها بعداً قابل تغییر نیستن، پس با خیال خودت انتخاب کن."
+)
+PARTNER_SETUP_GENDERS = {
+    "FEMALE": "دختر",
+    "MALE": "پسر",
+}
+PARTNER_SETUP_AGES = {
+    "22": "۲۲",
+    "26": "۲۶",
+    "30": "۳۰",
+    "34": "۳۴",
+}
+PARTNER_SETUP_INTERESTS = {
+    "music": "موسیقی",
+    "books": "کتاب",
+    "movies": "فیلم",
+    "travel": "سفر",
+    "coffee": "قهوه",
+    "games": "بازی",
+}
+PARTNER_SETUP_FEMALE_NAMES = ["سارا", "آوا", "نگار", "النا"]
+PARTNER_SETUP_MALE_NAMES = ["سینا", "سامان", "پویان", "کیوان"]
+PARTNER_SETUP_INTEREST_LIMIT = 3
+
+
 DEFAULT_LIARA_BASE_URL = "https://ai.liara.ir/api/699f21b89537b64832e9b9fa/v1"
 DEFAULT_LIARA_MODEL = "x-ai/grok-3-mini-beta"
 
@@ -53,7 +80,9 @@ def _get_ai_base_url() -> str:
 
 
 def _get_ai_model() -> str:
-    return (os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL).strip()
+    return (
+        os.getenv("LIARA_AI_MODEL") or os.getenv("OPENAI_MODEL") or DEFAULT_LIARA_MODEL
+    ).strip()
 
 
 def _get_ai_timeout_seconds() -> float:
@@ -62,7 +91,7 @@ def _get_ai_timeout_seconds() -> float:
         timeout = float(raw)
     except Exception:  # noqa: BLE001
         timeout = 2.0
-    return min(max(timeout, 0.6), 30.0)
+    return min(max(timeout, 0.6), 10.0)
 
 
 def _get_ai_retry_timeout_seconds() -> float:
@@ -89,16 +118,20 @@ def _is_ai_timeout_retry_enabled() -> bool:
 
 def _looks_like_timeout_error(exc: Exception) -> bool:
     msg = str(exc).lower()
-    if any(token in msg for token in ["timeout", "timed out", "readtimeout", "api timeout"]):
+    if any(
+        token in msg for token in ["timeout", "timed out", "readtimeout", "api timeout"]
+    ):
         return True
     cause = getattr(exc, "__cause__", None)
     while cause:
         cmsg = str(cause).lower()
-        if any(token in cmsg for token in ["timeout", "timed out", "readtimeout", "api timeout"]):
+        if any(
+            token in cmsg
+            for token in ["timeout", "timed out", "readtimeout", "api timeout"]
+        ):
             return True
         cause = getattr(cause, "__cause__", None)
     return False
-
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -107,12 +140,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return default
     return raw in {"1", "true", "yes", "on"}
 
+
 def _get_ai_client(timeout_seconds: float | None = None) -> OpenAI | None:
     api_key = _get_ai_api_key()
     if not api_key:
         return None
-    timeout = timeout_seconds if timeout_seconds is not None else _get_ai_timeout_seconds()
-    return OpenAI(api_key=api_key, base_url=_get_ai_base_url(), timeout=timeout, max_retries=0)
+    timeout = (
+        timeout_seconds if timeout_seconds is not None else _get_ai_timeout_seconds()
+    )
+    return OpenAI(
+        api_key=api_key, base_url=_get_ai_base_url(), timeout=timeout, max_retries=0
+    )
 
 
 def _call_ai_with_deadline(ai_client: OpenAI, *, timeout_seconds: float, **kwargs):
@@ -147,7 +185,9 @@ def _load_prompt_contract_text() -> str:
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram_webhook: unable to load prompt contract %s error=%s", path, exc)
+        logger.warning(
+            "telegram_webhook: unable to load prompt contract %s error=%s", path, exc
+        )
         return ""
     marker = "## System Contract"
     if marker in text:
@@ -162,7 +202,9 @@ def _load_nsfw_activation_text() -> str:
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram_webhook: unable to load nsfw_activation_v1.md error=%s", exc)
+        logger.warning(
+            "telegram_webhook: unable to load nsfw_activation_v1.md error=%s", exc
+        )
         return ""
 
     marker = "# NSFW Activation V1"
@@ -171,15 +213,15 @@ def _load_nsfw_activation_text() -> str:
     return text.strip()
 
 
-
-
 @lru_cache(maxsize=1)
 def _load_tone_bible_excerpt() -> str:
     path = DOCS_DIR / "tone_system_v1.md"
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram_webhook: unable to load tone bible %s error=%s", path, exc)
+        logger.warning(
+            "telegram_webhook: unable to load tone bible %s error=%s", path, exc
+        )
         return ""
     lines: list[str] = []
     for line in text.splitlines():
@@ -189,6 +231,7 @@ def _load_tone_bible_excerpt() -> str:
         if len(lines) >= 6:
             break
     return " | ".join(lines)
+
 
 @lru_cache(maxsize=1)
 def _load_onboarding_questions() -> list[tuple[str, str]]:
@@ -203,7 +246,9 @@ def _load_onboarding_questions() -> list[tuple[str, str]]:
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram_webhook: unable to load onboarding doc %s error=%s", path, exc)
+        logger.warning(
+            "telegram_webhook: unable to load onboarding doc %s error=%s", path, exc
+        )
         return defaults
 
     parsed: list[str] = []
@@ -215,7 +260,13 @@ def _load_onboarding_questions() -> list[tuple[str, str]]:
                 parsed.append(q)
     if len(parsed) < 5:
         return defaults
-    keys = ["nickname", "reply_length_pref", "active_time_pattern", "tone_preference", "intimacy_tolerance"]
+    keys = [
+        "nickname",
+        "reply_length_pref",
+        "active_time_pattern",
+        "tone_preference",
+        "intimacy_tolerance",
+    ]
     return list(zip(keys, parsed[:5]))
 
 
@@ -235,11 +286,261 @@ def _onboarding_state(state: BotUserState) -> dict[str, Any]:
 def _save_onboarding_state(state: BotUserState, data: dict[str, Any]) -> None:
     rules = dict(state.style_rules or {})
     rules["onboarding_v1"] = data
-    BotUserState.objects.filter(id=state.id).update(style_rules=rules, updated_at=timezone.now())
+    BotUserState.objects.filter(id=state.id).update(
+        style_rules=rules, updated_at=timezone.now()
+    )
     state.style_rules = rules
 
 
-def _maybe_progress_onboarding(user: User, conversation: Conversation, normalized: str) -> list[dict[str, Any]]:
+def _partner_setup_state(state: BotUserState) -> dict[str, Any]:
+    rules = dict(state.style_rules or {})
+    data = dict(rules.get(PARTNER_SETUP_KEY) or {})
+    data.setdefault("step", "gender")
+    data.setdefault("answers", {})
+    return data
+
+
+def _save_partner_setup_state(state: BotUserState, data: dict[str, Any]) -> None:
+    rules = dict(state.style_rules or {})
+    rules[PARTNER_SETUP_KEY] = data
+    BotUserState.objects.filter(id=state.id).update(
+        style_rules=rules, updated_at=timezone.now()
+    )
+    state.style_rules = rules
+
+
+def _partner_setup_completed(state: BotUserState | None) -> bool:
+    if not state:
+        return False
+    return bool(_partner_setup_state(state).get("completed"))
+
+
+def _partner_setup_required(state: BotUserState, conversation: Conversation) -> bool:
+    if _partner_setup_completed(state):
+        return False
+
+    rules = dict(state.style_rules or {})
+    if (
+        PARTNER_SETUP_KEY not in rules
+        and conversation.messages.filter(role=Message.Role.USER).exists()
+    ):
+        flow = _partner_setup_state(state)
+        flow["completed"] = True
+        flow["legacy_skip"] = True
+        flow["completed_at"] = timezone.now().isoformat()
+        _save_partner_setup_state(state, flow)
+        return False
+
+    return True
+
+
+def _partner_setup_keyboard(
+    step: str, answers: dict[str, Any]
+) -> list[list[dict[str, str]]]:
+    if step == "gender":
+        return [
+            [{"text": label, "callback_data": f"psetup:gender:{value}"}]
+            for value, label in PARTNER_SETUP_GENDERS.items()
+        ]
+
+    if step == "name":
+        names = (
+            PARTNER_SETUP_MALE_NAMES
+            if answers.get("gender") == "MALE"
+            else PARTNER_SETUP_FEMALE_NAMES
+        )
+        return [
+            [{"text": name, "callback_data": f"psetup:name:{name}"}] for name in names
+        ]
+
+    if step == "age":
+        return [
+            [
+                {"text": label, "callback_data": f"psetup:age:{value}"}
+                for value, label in list(PARTNER_SETUP_AGES.items())[idx : idx + 2]
+            ]
+            for idx in range(0, len(PARTNER_SETUP_AGES), 2)
+        ]
+
+    if step == "interests":
+        selected = set(answers.get("interests") or [])
+        rows: list[list[dict[str, str]]] = []
+        items = list(PARTNER_SETUP_INTERESTS.items())
+        for idx in range(0, len(items), 2):
+            row = []
+            for value, label in items[idx : idx + 2]:
+                prefix = "✅ " if value in selected else ""
+                row.append(
+                    {
+                        "text": f"{prefix}{label}",
+                        "callback_data": f"psetup:interest:{value}",
+                    }
+                )
+            rows.append(row)
+        if selected:
+            rows.append([{"text": "تمام شد", "callback_data": "psetup:done"}])
+        return rows
+
+    return []
+
+
+def _partner_setup_prompt(step: str, answers: dict[str, Any]) -> str:
+    if step == "gender":
+        return (
+            "اول پارتنر دیجیتالت رو بسازیم.\nجنسیتش رو انتخاب کن.\n"
+            + PARTNER_SETUP_LOCKED_TEXT
+        )
+    if step == "name":
+        return "اسمش چی باشه؟\n" + PARTNER_SETUP_LOCKED_TEXT
+    if step == "age":
+        return (
+            f"سن {answers.get('name', 'پارتنرت')} چند باشه؟\n"
+            + PARTNER_SETUP_LOCKED_TEXT
+        )
+    if step == "interests":
+        selected_count = len(answers.get("interests") or [])
+        return (
+            f"علایق {answers.get('name', 'پارتنرت')} رو انتخاب کن؛ تا {PARTNER_SETUP_INTEREST_LIMIT} تا. "
+            f"الان {selected_count} تا انتخاب شده.\n" + PARTNER_SETUP_LOCKED_TEXT
+        )
+    return "پارتنر دیجیتالت آماده‌ست."
+
+
+def _partner_setup_reply(state: BotUserState) -> dict[str, Any]:
+    flow = _partner_setup_state(state)
+    step = flow.get("step", "gender")
+    answers = dict(flow.get("answers") or {})
+    return _reply_payload(
+        _partner_setup_prompt(step, answers),
+        keyboard=_partner_setup_keyboard(step, answers),
+    )
+
+
+def _interest_labels(values: list[str]) -> list[str]:
+    return [
+        PARTNER_SETUP_INTERESTS[value]
+        for value in values
+        if value in PARTNER_SETUP_INTERESTS
+    ]
+
+
+def _apply_partner_setup(
+    user: User, bot: Bot, state: BotUserState, answers: dict[str, Any]
+) -> None:
+    name = str(answers.get("name") or bot.display_name or "همراه").strip()[:48]
+    gender = str(answers.get("gender") or bot.gender or "").strip().upper()
+    age = str(answers.get("age") or "").strip()
+    interests = [
+        item for item in answers.get("interests", []) if item in PARTNER_SETUP_INTERESTS
+    ][:PARTNER_SETUP_INTEREST_LIMIT]
+    interest_labels = _interest_labels(interests)
+
+    Bot.objects.filter(id=bot.id).update(
+        display_name=name, gender=gender, updated_at=timezone.now()
+    )
+    bot.display_name = name
+    bot.gender = gender
+
+    identity, _ = BotIdentity.objects.get_or_create(bot=bot)
+    profile = dict(identity.identity_profile or {})
+    profile["name"] = name
+    profile["age"] = age
+    profile["gender"] = PARTNER_SETUP_GENDERS.get(gender, gender)
+    profile["favorites"] = interest_labels or profile.get("favorites", [])
+    profile.setdefault("values", ["راحت بودن", "گفت‌وگوی صادقانه"])
+    BotIdentity.objects.filter(bot=bot).update(
+        identity_profile=profile, updated_at=timezone.now()
+    )
+
+    relationship = dict(state.relationship_memory or {})
+    relationship["digital_partner_profile"] = {
+        "name": name,
+        "gender": gender,
+        "age": age,
+        "interests": interest_labels,
+        "locked": True,
+        "completed_at": timezone.now().isoformat(),
+    }
+    BotUserState.objects.filter(id=state.id).update(
+        relationship_memory=relationship, updated_at=timezone.now()
+    )
+    state.relationship_memory = relationship
+
+
+def _handle_partner_setup_callback(
+    user: User, conversation: Conversation, normalized: str
+) -> list[dict[str, Any]]:
+    state = _ensure_state(user, conversation.bot)
+    flow = _partner_setup_state(state)
+    if flow.get("completed"):
+        return [
+            _reply_payload(
+                "پارتنر دیجیتالت قبلاً ساخته شده و این انتخاب‌ها قابل تغییر نیستن."
+            )
+        ]
+
+    answers = dict(flow.get("answers") or {})
+    parts = normalized.split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    value = parts[2] if len(parts) > 2 else ""
+
+    if action == "gender" and value in PARTNER_SETUP_GENDERS:
+        answers["gender"] = value
+        flow["step"] = "name"
+    elif action == "name" and value:
+        answers["name"] = value[:48]
+        flow["step"] = "age"
+    elif action == "age" and value in PARTNER_SETUP_AGES:
+        answers["age"] = value
+        flow["step"] = "interests"
+    elif action == "interest" and value in PARTNER_SETUP_INTERESTS:
+        selected = list(answers.get("interests") or [])
+        if value in selected:
+            selected.remove(value)
+        elif len(selected) < PARTNER_SETUP_INTEREST_LIMIT:
+            selected.append(value)
+        answers["interests"] = selected
+        flow["step"] = "interests"
+    elif action == "done" and answers.get("interests"):
+        flow["completed"] = True
+        flow["step"] = "done"
+        flow["completed_at"] = timezone.now().isoformat()
+        _apply_partner_setup(user, conversation.bot, state, answers)
+    else:
+        flow["answers"] = answers
+        _save_partner_setup_state(state, flow)
+        return [_partner_setup_reply(state)]
+
+    flow["answers"] = answers
+    _save_partner_setup_state(state, flow)
+
+    if flow.get("completed"):
+        name = answers.get("name") or conversation.bot.display_name
+        interests = "، ".join(_interest_labels(answers.get("interests") or []))
+        text = (
+            f"تموم شد. {name} ساخته شد.\n"
+            f"سن: {PARTNER_SETUP_AGES.get(str(answers.get('age')), answers.get('age'))} | علاقه‌ها: {interests}\n"
+            "این‌ها قفل شدن و بعداً قابل تغییر نیستن. حالا هرچی دوست داری بگو تا کم‌کم پروفایل رابطه‌تون کامل‌تر شه."
+        )
+        return [_reply_payload(text)]
+
+    return [_partner_setup_reply(state)]
+
+
+def _maybe_block_for_partner_setup(
+    user: User, conversation: Conversation, normalized: str
+) -> list[dict[str, Any]]:
+    state = _ensure_state(user, conversation.bot)
+    if not _partner_setup_required(state, conversation):
+        return []
+    if normalized.startswith("psetup:"):
+        return _handle_partner_setup_callback(user, conversation, normalized)
+    return [_partner_setup_reply(state)]
+
+
+def _maybe_progress_onboarding(
+    user: User, conversation: Conversation, normalized: str
+) -> list[dict[str, Any]]:
     state = _ensure_state(user, conversation.bot)
     flow = _onboarding_state(state)
     questions = _load_onboarding_questions()
@@ -262,7 +563,9 @@ def _maybe_progress_onboarding(user: User, conversation: Conversation, normalize
         }
         relationship = dict(state.relationship_memory or {})
         relationship["partner_profile_v1"] = partner_profile
-        BotUserState.objects.filter(id=state.id).update(relationship_memory=relationship, updated_at=timezone.now())
+        BotUserState.objects.filter(id=state.id).update(
+            relationship_memory=relationship, updated_at=timezone.now()
+        )
         state.relationship_memory = relationship
         flow["completed"] = True
         _save_onboarding_state(state, flow)
@@ -296,6 +599,7 @@ def _maybe_progress_onboarding(user: User, conversation: Conversation, normalize
     _save_onboarding_state(state, flow)
     return [_reply_payload(question)]
 
+
 def _load_json(request):
     try:
         return json.loads(request.body or "{}")
@@ -307,7 +611,9 @@ def _load_json(request):
 def _telegram_request(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.warning("telegram_webhook: missing TELEGRAM_BOT_TOKEN env, cannot send %s", method)
+        logger.warning(
+            "telegram_webhook: missing TELEGRAM_BOT_TOKEN env, cannot send %s", method
+        )
         return None
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
@@ -315,7 +621,9 @@ def _telegram_request(method: str, payload: dict[str, Any]) -> dict[str, Any] | 
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("telegram_webhook: failed %s with payload=%s error=%s", method, payload, exc)
+        logger.exception(
+            "telegram_webhook: failed %s with payload=%s error=%s", method, payload, exc
+        )
         return None
 
 
@@ -337,6 +645,8 @@ def _detect_intent(text: str) -> Intent:
 
     if normalized in {"/start", "start"}:
         return Intent("start")
+    if normalized.startswith("psetup:"):
+        return Intent("partner_setup")
     if normalized in {"شروع کنیم", "start_now"}:
         return Intent("start_now")
     if normalized in {"یه کم درباره‌اش بگو", "about"}:
@@ -345,7 +655,9 @@ def _detect_intent(text: str) -> Intent:
         return Intent("ask_more")
     if normalized in {"جمع‌بندی کوتاه", "summary"} or _has_any({"خلاصه", "جمع بندی"}):
         return Intent("summary")
-    if normalized in {"سکه‌هام", "balance"} or _has_any({"کیف پول", "سکه", "balance", "wallet"}):
+    if normalized in {"سکه‌هام", "balance"} or _has_any(
+        {"کیف پول", "سکه", "balance", "wallet"}
+    ):
         return Intent("wallet_status")
     if _has_any({"تراکنش", "پرداخت", "خرید"}) and not normalized.startswith("pack:"):
         return Intent("txn_history")
@@ -355,7 +667,9 @@ def _detect_intent(text: str) -> Intent:
         return Intent("settings")
     if normalized in {"خرید سکه", "buy_coins", "packs"}:
         return Intent("pack_list")
-    if normalized in {"دستورات", "commands", "منو", "menu"} or _has_any({"منو", "دستور"}):
+    if normalized in {"دستورات", "commands", "منو", "menu"} or _has_any(
+        {"منو", "دستور"}
+    ):
         return Intent("command_menu")
     if _has_any({"پروفایل ربات", "هویت ربات", "identity", "persona"}):
         return Intent("bot_profile")
@@ -437,7 +751,9 @@ def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
 
     ai_client = _get_ai_client()
     if not ai_client:
-        logger.warning("telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY, using fallback bot traits")
+        logger.warning(
+            "telegram_webhook: missing LIARA_AI_API_KEY/OPENAI_API_KEY, using fallback bot traits"
+        )
         return {}
 
     model = _get_ai_model()
@@ -472,7 +788,9 @@ def _llm_personal_traits(user: User, gender: str) -> dict[str, Any]:
         content = response.choices[0].message.content or ""
         return json.loads(content)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram_webhook: llm traits failed (%s), using fallback bot traits", exc)
+        logger.warning(
+            "telegram_webhook: llm traits failed (%s), using fallback bot traits", exc
+        )
         return {}
 
 
@@ -483,11 +801,15 @@ def _personal_bot_code(template: Bot, user: User) -> str:
     return code[:32]
 
 
-def _clone_identity_from_template(bot: Bot, template: Bot, *, identity_profile: dict[str, Any] | None = None) -> None:
+def _clone_identity_from_template(
+    bot: Bot, template: Bot, *, identity_profile: dict[str, Any] | None = None
+) -> None:
     existing_identity = BotIdentity.objects.filter(bot=bot).first()
     if existing_identity:
         if identity_profile:
-            BotIdentity.objects.filter(bot=bot).update(identity_profile=identity_profile, updated_at=timezone.now())
+            BotIdentity.objects.filter(bot=bot).update(
+                identity_profile=identity_profile, updated_at=timezone.now()
+            )
         return
 
     template_identity: BotIdentity | None = getattr(template, "identity", None)
@@ -520,7 +842,9 @@ def _clone_identity_from_template(bot: Bot, template: Bot, *, identity_profile: 
                 "emotional_clarity": template_identity.emotional_clarity,
                 "memory_strength": template_identity.memory_strength,
                 "memory_noise": template_identity.memory_noise,
-                "identity_profile": profile or template_profile or _default_identity_profile(),
+                "identity_profile": profile
+                or template_profile
+                or _default_identity_profile(),
                 "avoids_advice": template_identity.avoids_advice,
                 "avoids_therapy_tone": template_identity.avoids_therapy_tone,
                 "avoids_omniscience": template_identity.avoids_omniscience,
@@ -541,7 +865,9 @@ def _ensure_personal_bot(user: User) -> Bot | None:
     bot_name = (traits.get("name") or "").strip() if isinstance(traits, dict) else ""
     bot_name = bot_name or _pick_bot_name(gender, user)
     name_hint = user.first_name or user.telegram_username or "دوست"
-    personal_prompt = template.base_prompt_text.strip() if template.base_prompt_text else ""
+    personal_prompt = (
+        template.base_prompt_text.strip() if template.base_prompt_text else ""
+    )
     personal_hint = (
         f"این بات همراه اختصاصی {name_hint} است؛ مثل یک آدم واقعی و خودمونی حرف بزن، "
         "مستقیم جواب بده و از لحن مشاوره‌ای یا پشتیبانی دوری کن؛ "
@@ -622,7 +948,9 @@ def _touch_user(telegram_payload: dict[str, Any]) -> User:
         "last_name": last_name or "",
         "last_seen_at": timezone.now(),
     }
-    user, created = User.objects.update_or_create(telegram_id=int(telegram_id), defaults=defaults)
+    user, created = User.objects.update_or_create(
+        telegram_id=int(telegram_id), defaults=defaults
+    )
     if not user.assigned_bot:
         _ensure_personal_bot(user)
     ensure_wallet(user)
@@ -648,7 +976,11 @@ def _format_ts(dt: datetime | None) -> str:
     return dt.astimezone(timezone.get_current_timezone()).strftime("%Y-%m-%d %H:%M")
 
 
-def _reply_payload(text: str, keyboard: list[list[dict[str, str]]] | None = None, parse_mode: str | None = None):
+def _reply_payload(
+    text: str,
+    keyboard: list[list[dict[str, str]]] | None = None,
+    parse_mode: str | None = None,
+):
     payload: dict[str, Any] = {"text": text}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
@@ -658,7 +990,9 @@ def _reply_payload(text: str, keyboard: list[list[dict[str, str]]] | None = None
 
 
 def _last_user_message_text(conversation: Conversation) -> str:
-    last_user = conversation.messages.filter(role=Message.Role.USER).order_by("-seq").first()
+    last_user = (
+        conversation.messages.filter(role=Message.Role.USER).order_by("-seq").first()
+    )
     return (last_user.text or "").strip() if last_user else ""
 
 
@@ -681,7 +1015,9 @@ def _txn_history_replies(user: User) -> list[dict[str, Any]]:
     lines = []
     for txn in txns:
         sign = "+" if txn.delta > 0 else "-"
-        lines.append(f"{_format_ts(txn.created_at)} | {txn.get_reason_display()} | {sign}{abs(txn.delta)} | موجودی پس از آن: {txn.balance_after or 'نامشخص'}")
+        lines.append(
+            f"{_format_ts(txn.created_at)} | {txn.get_reason_display()} | {sign}{abs(txn.delta)} | موجودی پس از آن: {txn.balance_after or 'نامشخص'}"
+        )
     body = "آخرین تراکنش‌ها:\n" + "\n".join(lines)
     return [_reply_payload(body)]
 
@@ -695,16 +1031,28 @@ def _bot_profile_replies(bot: Bot, user: User) -> list[dict[str, Any]]:
     trust = f"{state.trust:.2f}" if state else "0.00"
     verbosity = f"{state.user_pref_verbosity:.2f}" if state else "0.00"
     questions = f"{state.user_pref_questions:.2f}" if state else "0.00"
+    partner_profile = (
+        dict((state.relationship_memory or {}).get("digital_partner_profile") or {})
+        if state
+        else {}
+    )
+    interests = "، ".join(partner_profile.get("interests") or [])
     lines = [
         f"بات: {bot.display_name} ({bot.code})",
         f"هویت پایه: لحن={tone} / پس‌زمینه={background}",
         f"آشنایی/اعتماد: {familiarity} / {trust}",
         f"ترجیحات پاسخ: verbosity={verbosity} / questions={questions}",
     ]
+    if partner_profile:
+        lines.append(
+            f"پارتنر دیجیتال: نام={partner_profile.get('name', bot.display_name)} / سن={partner_profile.get('age', 'نامشخص')} / علاقه‌ها={interests or 'نامشخص'}"
+        )
     return [_reply_payload("\n".join(lines))]
 
 
-def _command_menu_replies(conversation: Conversation, user: User) -> list[dict[str, Any]]:
+def _command_menu_replies(
+    conversation: Conversation, user: User
+) -> list[dict[str, Any]]:
     wallet = ensure_wallet(user)
     keyboard = [
         [{"text": "💰 کیف پول", "callback_data": "wallet"}],
@@ -720,7 +1068,9 @@ def _command_menu_replies(conversation: Conversation, user: User) -> list[dict[s
     return [_reply_payload(hint, keyboard=keyboard)]
 
 
-def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_user_text: str):
+def _contextual_keyboard(
+    conversation: Conversation, wallet_balance: int, last_user_text: str
+):
     has_history = conversation.messages.exists()
     keyboard: list[list[dict[str, str]]] = []
     is_question = "?" in last_user_text or "؟" in last_user_text
@@ -747,7 +1097,12 @@ def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_u
             {"text": "کیف پول", "callback_data": "wallet"},
         ]
     )
-    keyboard.append([{"text": "🧾 تراکنش‌ها", "callback_data": "txns"}, {"text": "⚙️ تنظیمات", "callback_data": "settings"}])
+    keyboard.append(
+        [
+            {"text": "🧾 تراکنش‌ها", "callback_data": "txns"},
+            {"text": "⚙️ تنظیمات", "callback_data": "settings"},
+        ]
+    )
 
     if is_closing and has_history:
         keyboard.append([{"text": "جمع‌بندی کوتاه", "callback_data": "summary"}])
@@ -761,13 +1116,19 @@ def _contextual_keyboard(conversation: Conversation, wallet_balance: int, last_u
 
 
 def _start_replies(user: User, conversation: Conversation):
+    state = _ensure_state(user, conversation.bot)
+    if _partner_setup_required(state, conversation):
+        return [_partner_setup_reply(state)]
+
     wallet = ensure_wallet(user)
     has_history = conversation.messages.exists()
     last_user_text = _last_user_message_text(conversation)
     keyboard = _contextual_keyboard(conversation, wallet.balance, last_user_text)
 
     if has_history:
-        welcome = "سلام دوباره. از همین‌جا می‌تونیم ادامه بدیم؛ جواب‌هام کوتاهه و بی‌نصیحت."
+        welcome = (
+            "سلام دوباره. از همین‌جا می‌تونیم ادامه بدیم؛ جواب‌هام کوتاهه و بی‌نصیحت."
+        )
     else:
         welcome = "سلام. اینجا می‌تونی راحت حرف بزنی؛ جواب‌هام کوتاهه و گیر نمی‌دم."
 
@@ -815,13 +1176,18 @@ def _record_bot_message(
     )
     now = timezone.now()
     Conversation.objects.filter(id=conversation.id).update(
-        last_activity_at=now, last_bot_reply_at=now, has_unread_bot_message=True, updated_at=now
+        last_activity_at=now,
+        last_bot_reply_at=now,
+        has_unread_bot_message=True,
+        updated_at=now,
     )
     _refresh_memory_summary(conversation)
     return msg
 
 
-def _record_user_message(conversation: Conversation, text: str, telegram_ids: dict[str, Any]) -> Message:
+def _record_user_message(
+    conversation: Conversation, text: str, telegram_ids: dict[str, Any]
+) -> Message:
     seq = next_message_seq(conversation.id)
     msg = Message.objects.create(
         conversation=conversation,
@@ -832,7 +1198,9 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
         telegram_update_id=telegram_ids.get("update_id"),
     )
     now = timezone.now()
-    state = BotUserState.objects.filter(user=conversation.user, bot=conversation.bot).first()
+    state = BotUserState.objects.filter(
+        user=conversation.user, bot=conversation.bot
+    ).first()
     if state:
         BotUserState.objects.filter(id=state.id).update(
             last_user_message_at=now,
@@ -840,11 +1208,16 @@ def _record_user_message(conversation: Conversation, text: str, telegram_ids: di
             updated_at=now,
         )
     Conversation.objects.filter(id=conversation.id).update(
-        last_activity_at=now, last_user_message_at=now, has_unread_bot_message=False, updated_at=now
+        last_activity_at=now,
+        last_user_message_at=now,
+        has_unread_bot_message=False,
+        updated_at=now,
     )
     if state:
         _upsert_memory_fragment(state, text, now, source_ref=msg.id)
-        update_relationship_memory(state, _recent_user_texts(conversation), latest_text=text, now=now)
+        update_relationship_memory(
+            state, _recent_user_texts(conversation), latest_text=text, now=now
+        )
     _refresh_memory_summary(conversation)
     return msg
 
@@ -853,7 +1226,9 @@ def _coin_pack_buttons():
     packs = CoinPack.objects.filter(is_active=True).order_by("sort_order", "coins")[:5]
     if not packs:
         return None
-    return [[{"text": f"{p.coins} سکه", "callback_data": f"pack:{p.code}"}] for p in packs]
+    return [
+        [{"text": f"{p.coins} سکه", "callback_data": f"pack:{p.code}"}] for p in packs
+    ]
 
 
 def _create_purchase(user: User, pack: CoinPack) -> Purchase:
@@ -876,12 +1251,17 @@ def _paywall_replies():
         [{"text": "فعلاً نه", "callback_data": "no_pay"}],
     ]
     return [
-        _reply_payload("الان سکه‌ات تموم شده.\nاگه دوست داشتی ادامه بدیم، یه بسته بردار. اگر هم نه، اوکیه.", keyboard=keyboard)
+        _reply_payload(
+            "الان سکه‌ات تموم شده.\nاگه دوست داشتی ادامه بدیم، یه بسته بردار. اگر هم نه، اوکیه.",
+            keyboard=keyboard,
+        )
     ]
 
 
 def _settings_reply():
-    return _reply_payload("تنظیمات ساده:\n- کم‌حرف‌تر باش\n- یه کم بیشتر بپرس\n- ربات گاهی سر بزنه / نزنه\n- پاک کردن داده‌ها (اختیاری)")
+    return _reply_payload(
+        "تنظیمات ساده:\n- کم‌حرف‌تر باش\n- یه کم بیشتر بپرس\n- ربات گاهی سر بزنه / نزنه\n- پاک کردن داده‌ها (اختیاری)"
+    )
 
 
 def _recent_messages(conversation: Conversation, limit: int = 30):
@@ -890,7 +1270,9 @@ def _recent_messages(conversation: Conversation, limit: int = 30):
     return history
 
 
-def _refresh_memory_summary(conversation: Conversation, *, max_chars: int = 900, window: int = 40):
+def _refresh_memory_summary(
+    conversation: Conversation, *, max_chars: int = 900, window: int = 40
+):
     recent_messages = list(conversation.messages.order_by("-seq")[:window])
     recent_messages.reverse()
     lines: list[str] = []
@@ -917,7 +1299,9 @@ def _refresh_memory_summary(conversation: Conversation, *, max_chars: int = 900,
     if len(new_summary) > max_chars:
         new_summary = new_summary[:max_chars]
 
-    Conversation.objects.filter(id=conversation.id).update(memory_summary=new_summary, updated_at=timezone.now())
+    Conversation.objects.filter(id=conversation.id).update(
+        memory_summary=new_summary, updated_at=timezone.now()
+    )
     conversation.memory_summary = new_summary
 
 
@@ -1017,9 +1401,31 @@ def _should_activate_nsfw(
 
     # اولویت ۲: وجود کلمات کلیدی سکسی در پیام فعلی یا ۸ پیام آخر کاربر
     nsfw_keywords = {
-        "کیر", "کس", "کون", "کص", "کییر", "کوس", "گای", "گائیدن", "مکیدن",
-        "لیسیدن", "جیش", "حشری", "سکس", "سکسچت", "پورن", "ارضا", "آب کشیدن",
-        "نوک کیر", "تخم", "کلیتور", "دهنم", "کونم", "کیرمو", "لب بزن", "بخورم",
+        "کیر",
+        "کس",
+        "کون",
+        "کص",
+        "کییر",
+        "کوس",
+        "گای",
+        "گائیدن",
+        "مکیدن",
+        "لیسیدن",
+        "جیش",
+        "حشری",
+        "سکس",
+        "سکسچت",
+        "پورن",
+        "ارضا",
+        "آب کشیدن",
+        "نوک کیر",
+        "تخم",
+        "کلیتور",
+        "دهنم",
+        "کونم",
+        "کیرمو",
+        "لب بزن",
+        "بخورم",
     }
 
     text_lower = (normalized_user_text or "").lower()
@@ -1036,7 +1442,9 @@ def _should_activate_nsfw(
 
 def _mode_instruction(mode: str) -> str:
     if mode == "answer":
-        return "mode=answer: راحت و خودمونی جواب بده؛ مستقیم برو سر اصل مطلب و سؤال نپرس."
+        return (
+            "mode=answer: راحت و خودمونی جواب بده؛ مستقیم برو سر اصل مطلب و سؤال نپرس."
+        )
     if mode == "clarify":
         return "mode=clarify: اول تلاش کن بدون سؤال جواب بدی؛ فقط اگر ابهام جدی بود یک سؤال کوتاه و دقیق بپرس."
     if mode == "guide":
@@ -1132,7 +1540,9 @@ def _memory_fragments_instruction(state: BotUserState | None) -> str:
     )
 
 
-def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: BotIdentity | None) -> str:
+def _persona_style_instructions(
+    state: BotUserState | None, bot: Bot, identity: BotIdentity | None
+) -> str:
     colloquial_guardrails = (
         "تو یک آدم واقعی هستی، نه دستیار، نه مشاور، نه تراپیست و نه ربات پشتیبانی. "
         "کاملاً محاوره‌ای، خودمونی و طبیعی مثل چت تلگرام بین دو دوست حرف بزن. "
@@ -1165,21 +1575,28 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
             "DRY": "لحن خشک اما محترمانه؛ از شوخی و احساسات اضافی پرهیز کن.",
         }
         pieces.append(tone_map.get(identity.core_tone, "لحن ساده و محترمانه نگه دار."))
-        pieces.append(f"پس‌زمینه هویت: {identity.background_seed} (به عنوان لحن، نه داستان).")
+        pieces.append(
+            f"پس‌زمینه هویت: {identity.background_seed} (به عنوان لحن، نه داستان)."
+        )
 
         talk_scale = identity.talkativeness
         if talk_scale < 0.25:
             pieces.append("خروجی را به یک پاراگراف کوتاه (حداکثر ۲ جمله) محدود کن.")
         elif talk_scale < 0.55:
-            pieces.append("خروجی را مختصر نگه دار و اگر لازم بود یک جمله توضیح اضافه کن.")
+            pieces.append(
+                "خروجی را مختصر نگه دار و اگر لازم بود یک جمله توضیح اضافه کن."
+            )
         else:
-            pieces.append("اگر نکته مهمی وجود دارد، نهایتاً سه جمله بنویس اما هنوز فشرده بمان.")
+            pieces.append(
+                "اگر نکته مهمی وجود دارد، نهایتاً سه جمله بنویس اما هنوز فشرده بمان."
+            )
 
         profile_hint = _identity_profile_instruction(identity)
         if profile_hint:
             pieces.append(profile_hint)
 
     if state:
+
         def _bucket(value: float, low: float, mid: float):
             if value <= low:
                 return "low"
@@ -1193,7 +1610,9 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
         elif verbosity_level == "mid":
             pieces.append("verbosity=mid → یک پاراگراف خیلی کوتاه با حداکثر سه جمله.")
         else:
-            pieces.append("verbosity=high → می‌توانی سه جمله فشرده و بدون تکرار بنویسی.")
+            pieces.append(
+                "verbosity=high → می‌توانی سه جمله فشرده و بدون تکرار بنویسی."
+            )
 
         questions_level = _bucket(state.user_pref_questions, 0.2, 0.6)
         if questions_level == "low":
@@ -1201,15 +1620,23 @@ def _persona_style_instructions(state: BotUserState | None, bot: Bot, identity: 
         elif questions_level == "mid":
             pieces.append("questions=mid → حداکثر یک سؤال کوتاه اگر ابهام حیاتی است.")
         else:
-            pieces.append("questions=high → حداکثر دو سؤال مشخص، فقط اگر question_budget اجازه داد.")
+            pieces.append(
+                "questions=high → حداکثر دو سؤال مشخص، فقط اگر question_budget اجازه داد."
+            )
 
-        closeness_score = (state.familiarity + state.trust + state.emotional_closeness) / 3
+        closeness_score = (
+            state.familiarity + state.trust + state.emotional_closeness
+        ) / 3
         if closeness_score < 0.2:
-            pieces.append("اعتماد پایین است؛ باز هم خودمونی و خیلی ساده حرف بزن، فقط محتاط و بدون فرضیات.")
+            pieces.append(
+                "اعتماد پایین است؛ باز هم خودمونی و خیلی ساده حرف بزن، فقط محتاط و بدون فرضیات."
+            )
         elif closeness_score < 0.5:
             pieces.append("اعتماد متوسط؛ خودمونی و دوستانه بمان، زیاده‌روی نکن.")
         else:
-            pieces.append("اعتماد بالا؛ راحت‌تر و صمیمی‌تر حرف بزن ولی از نصیحت دوری کن.")
+            pieces.append(
+                "اعتماد بالا؛ راحت‌تر و صمیمی‌تر حرف بزن ولی از نصیحت دوری کن."
+            )
 
         if state.style_rules:
             pieces.append(f"خط‌مشی کشف‌شده: {state.style_rules}")
@@ -1239,11 +1666,29 @@ def _question_budget_decision(normalized_user_text: str) -> tuple[int, str]:
     greeting_keywords = {"سلام", "درود", "hi", "hello"}
     tokens = text.split()
     word_count = len(tokens)
-    if any(k in text for k in greeting_keywords) and word_count <= 4 and not has_question_mark:
+    if (
+        any(k in text for k in greeting_keywords)
+        and word_count <= 4
+        and not has_question_mark
+    ):
         return 0, "سلام یا شروع کوتاه بدون ابهام"
 
-    vague_markers = {"کمک", "مشکل", "مسئله", "مسأله", "سوال", "سؤال", "گیر کردم", "نمی‌دانم", "نمیدونم"}
-    if word_count <= 3 and any(marker in text for marker in vague_markers) and not has_question_mark:
+    vague_markers = {
+        "کمک",
+        "مشکل",
+        "مسئله",
+        "مسأله",
+        "سوال",
+        "سؤال",
+        "گیر کردم",
+        "نمی‌دانم",
+        "نمیدونم",
+    }
+    if (
+        word_count <= 3
+        and any(marker in text for marker in vague_markers)
+        and not has_question_mark
+    ):
         return 1, "درخواست کلی و مبهم است"
 
     if word_count <= 2 and not has_question_mark:
@@ -1252,13 +1697,18 @@ def _question_budget_decision(normalized_user_text: str) -> tuple[int, str]:
     return 0, "درخواست برای پاسخ کافی است"
 
 
-def _enforce_mode_on_budget(mode: str, question_budget: int, budget_reason: str, mode_reason: str) -> tuple[int, str]:
+def _enforce_mode_on_budget(
+    mode: str, question_budget: int, budget_reason: str, mode_reason: str
+) -> tuple[int, str]:
     if mode == "answer":
         return 0, f"mode=answer: سؤال ممنوع. {mode_reason}"
     if mode == "clarify":
         return 1, f"mode=clarify: فقط یک سؤال مجاز است. {mode_reason}"
     if mode == "guide":
-        return min(1, question_budget), f"mode=guide: یک سؤال یا گزینه کوتاه مجاز است. {budget_reason}"
+        return (
+            min(1, question_budget),
+            f"mode=guide: یک سؤال یا گزینه کوتاه مجاز است. {budget_reason}",
+        )
     if mode == "idle":
         return 0, f"mode=idle: فقط یک پاسخ خیلی کوتاه بدون سؤال. {mode_reason}"
     return question_budget, budget_reason
@@ -1342,10 +1792,14 @@ def _response_template_hint(
     is_feeling = any(k in text for k in feeling_keywords)
     long_chat = conversation.messages.count() >= 8
 
-    followup_hint = "بدون سؤال" if question_budget == 0 else "سؤال فقط اگر ابهام واقعی داری"
+    followup_hint = (
+        "بدون سؤال" if question_budget == 0 else "سؤال فقط اگر ابهام واقعی داری"
+    )
 
     if has_closing:
-        template = "جمع‌بندی: کوتاه و گرم خداحافظی کن، یک نکته مفید یادآوری کن و سؤال نپرس."
+        template = (
+            "جمع‌بندی: کوتاه و گرم خداحافظی کن، یک نکته مفید یادآوری کن و سؤال نپرس."
+        )
     elif is_feeling and not is_question:
         template = (
             "واکنش طبیعی: کوتاه، صمیمی و واقعی جواب بده؛ بدون جمله‌های کلیشه‌ای. "
@@ -1358,7 +1812,9 @@ def _response_template_hint(
     elif long_chat and not short_length:
         template = "پیگیری: طبیعی به حرف‌های قبلی وصل شو، یک پیشنهاد جمع‌وجور بده و بی‌دلیل سؤال نپرس."
     else:
-        template = f"اطلاعاتی: خودمونی و مستقیم جواب بده، خلاصه و روشن؛ {followup_hint}."
+        template = (
+            f"اطلاعاتی: خودمونی و مستقیم جواب بده، خلاصه و روشن؛ {followup_hint}."
+        )
 
     return f"راهنمای لحن پاسخ: {template}"
 
@@ -1376,10 +1832,14 @@ def _build_llm_messages(
 ):
     base_prompt = bot.base_prompt_text.strip() if bot.base_prompt_text else ""
     contract_prompt = _load_prompt_contract_text()
-    system_prompt = base_prompt or contract_prompt or (
-        "تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه درمانگر. "
-        "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم. "
-        "ترکیب فعل‌ها و اصطلاحات رو درست و رایج به کار ببر (مثلاً «لاس زدن»، «جذاب میشه»)."
+    system_prompt = (
+        base_prompt
+        or contract_prompt
+        or (
+            "تو نقش یک آدم واقعی در چت هستی، نه دستیار، نه مشاور، نه درمانگر. "
+            "مثل یک دوست معمولی و محاوره‌ای جواب بده؛ کوتاه، طبیعی و مستقیم. "
+            "ترکیب فعل‌ها و اصطلاحات رو درست و رایج به کار ببر (مثلاً «لاس زدن»، «جذاب میشه»)."
+        )
     )
     persona_rules = _persona_style_instructions(state, bot, identity)
     policy_hint = _question_policy_instructions(question_budget, budget_reason)
@@ -1400,17 +1860,23 @@ def _build_llm_messages(
     memory_hint = _memory_fragments_instruction(state)
     if memory_hint:
         messages.append({"role": "system", "content": memory_hint})
-    template_hint = _response_template_hint(normalized_user_text, conversation, question_budget)
+    template_hint = _response_template_hint(
+        normalized_user_text, conversation, question_budget
+    )
     messages.append({"role": "system", "content": template_hint})
     # ==================== NSFW ACTIVATION (V1) ====================
     recent_user_texts = _recent_user_texts(conversation, limit=8)
     nsfw_text = _load_nsfw_activation_text()
-    if nsfw_text and _should_activate_nsfw(state, normalized_user_text, recent_user_texts):
+    if nsfw_text and _should_activate_nsfw(
+        state, normalized_user_text, recent_user_texts
+    ):
         messages.append({"role": "system", "content": nsfw_text})
     # ==================== END NSFW ====================
     summary = (conversation.memory_summary or "").strip()
     if summary:
-        messages.append({"role": "system", "content": f"خلاصه گفت‌وگو تا اینجا: {summary}"})
+        messages.append(
+            {"role": "system", "content": f"خلاصه گفت‌وگو تا اینجا: {summary}"}
+        )
     for msg in _recent_messages(conversation):
         if msg.role == Message.Role.USER:
             role = "user"
@@ -1422,7 +1888,9 @@ def _build_llm_messages(
     return messages
 
 
-def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_text: str) -> dict[str, Any] | None:
+def _generate_ai_reply(
+    conversation: Conversation, bot: Bot, normalized_user_text: str
+) -> dict[str, Any] | None:
     started = time.monotonic()
     latency_budget_seconds = _get_ai_latency_budget_seconds()
     timeout_seconds = min(_get_ai_timeout_seconds(), latency_budget_seconds)
@@ -1436,7 +1904,9 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
     state = BotUserState.objects.filter(bot=bot, user=conversation.user).first()
     mode, mode_reason = _decide_conversation_mode(normalized_user_text)
     question_budget, budget_reason = _question_budget_decision(normalized_user_text)
-    question_budget, budget_reason = _enforce_mode_on_budget(mode, question_budget, budget_reason, mode_reason)
+    question_budget, budget_reason = _enforce_mode_on_budget(
+        mode, question_budget, budget_reason, mode_reason
+    )
     identity = getattr(bot, "identity", None)
     prompt_messages = _build_llm_messages(
         bot,
@@ -1484,8 +1954,16 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         )
         latency_ms = int((time.monotonic() - started) * 1000)
         usage = getattr(response, "usage", None)
-        token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
-        token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
+        token_in = (
+            getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0))
+            if usage
+            else 0
+        )
+        token_out = (
+            getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0))
+            if usage
+            else 0
+        )
         raw_text = (response.choices[0].message.content or "").strip()
         normalized_text = _normalize_colloquial_fa(raw_text)
         reply_text = _apply_question_budget_to_reply(normalized_text, question_budget)
@@ -1496,7 +1974,15 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
         log.token_in = token_in
         log.token_out = token_out
         log.request_id = getattr(response, "id", "")
-        log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
+        log.save(
+            update_fields=[
+                "latency_ms",
+                "token_in",
+                "token_out",
+                "request_id",
+                "updated_at",
+            ]
+        )
         logger.info(
             "telegram_webhook: ai success conversation=%s bot=%s latency_ms=%s token_in=%s token_out=%s",
             conversation.id,
@@ -1546,17 +2032,41 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
                     )
                     retry_latency_ms = int((time.monotonic() - retry_started) * 1000)
                     usage = getattr(retry_response, "usage", None)
-                    token_in = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)) if usage else 0
-                    token_out = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)) if usage else 0
+                    token_in = (
+                        getattr(
+                            usage, "prompt_tokens", getattr(usage, "input_tokens", 0)
+                        )
+                        if usage
+                        else 0
+                    )
+                    token_out = (
+                        getattr(
+                            usage,
+                            "completion_tokens",
+                            getattr(usage, "output_tokens", 0),
+                        )
+                        if usage
+                        else 0
+                    )
                     raw_text = (retry_response.choices[0].message.content or "").strip()
                     normalized_text = _normalize_colloquial_fa(raw_text)
-                    reply_text = _apply_question_budget_to_reply(normalized_text, question_budget)
+                    reply_text = _apply_question_budget_to_reply(
+                        normalized_text, question_budget
+                    )
                     if reply_text:
                         log.latency_ms = int((time.monotonic() - started) * 1000)
                         log.token_in = token_in
                         log.token_out = token_out
                         log.request_id = getattr(retry_response, "id", "")
-                        log.save(update_fields=["latency_ms", "token_in", "token_out", "request_id", "updated_at"])
+                        log.save(
+                            update_fields=[
+                                "latency_ms",
+                                "token_in",
+                                "token_out",
+                                "request_id",
+                                "updated_at",
+                            ]
+                        )
                         logger.info(
                             "telegram_webhook: ai retry success conversation=%s bot=%s total_latency_ms=%s token_in=%s token_out=%s",
                             conversation.id,
@@ -1565,7 +2075,11 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
                             token_in,
                             token_out,
                         )
-                        return {"text": reply_text, "token_in": token_in, "token_out": token_out}
+                        return {
+                            "text": reply_text,
+                            "token_in": token_in,
+                            "token_out": token_out,
+                        }
                     logger.warning(
                         "telegram_webhook: ai retry empty-reply conversation=%s bot=%s retry_latency_ms=%s",
                         conversation.id,
@@ -1610,12 +2124,17 @@ def _generate_ai_reply(conversation: Conversation, bot: Bot, normalized_user_tex
             )
         else:
             logger.exception(
-                "telegram_webhook: ai call failed conversation=%s bot=%s error=%s", conversation.id, bot.id, exc
+                "telegram_webhook: ai call failed conversation=%s bot=%s error=%s",
+                conversation.id,
+                bot.id,
+                exc,
             )
         return {"text": fallback_text, "token_in": 0, "token_out": 0}
 
 
-def _send_replies(chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None) -> bool:
+def _send_replies(
+    chat_id: int, replies: list[dict[str, Any]], reply_to_message_id: int | None = None
+) -> bool:
     success = True
     for reply in replies:
         _telegram_request("sendChatAction", {"chat_id": chat_id, "action": "typing"})
@@ -1644,18 +2163,31 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
         logger.error("telegram_webhook: no active bot for user=%s", user.id)
         return [_reply_payload("هیچ بات فعالی پیدا نشد.")]
 
-    message_meta = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
+    message_meta = (
+        update.get("message")
+        or update.get("callback_query", {}).get("message", {})
+        or {}
+    )
     normalized = (text or "").strip()
     intent = _detect_intent(normalized)
     if intent.kind == "start":
         return _start_replies(user, conversation)
+
+    setup_replies = _maybe_block_for_partner_setup(user, conversation, normalized)
+    if setup_replies:
+        for item in setup_replies:
+            _record_bot_message(conversation, item.get("text", ""))
+        return setup_replies
+
     if intent.kind == "start_now":
         _record_user_message(conversation, text, message_meta)
         return [_reply_payload("هرچی هست همین‌جا بگو.")]
     if intent.kind == "about":
         return _about_replies()
     if intent.kind == "ask_more":
-        return [_reply_payload("کدوم بخشش برات مبهمه؟ یک جمله بگو تا دقیق‌تر پاسخ بدم.")]
+        return [
+            _reply_payload("کدوم بخشش برات مبهمه؟ یک جمله بگو تا دقیق‌تر پاسخ بدم.")
+        ]
     if intent.kind == "pack_list":
         pack_buttons = _coin_pack_buttons()
         if pack_buttons:
@@ -1666,17 +2198,25 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
         try:
             pack = CoinPack.objects.get(code=code, is_active=True)
         except CoinPack.DoesNotExist:
-            logger.warning("telegram_webhook: pack not found code=%s user=%s", code, user.id)
+            logger.warning(
+                "telegram_webhook: pack not found code=%s user=%s", code, user.id
+            )
             return [_reply_payload("این بسته وجود ندارد.")]
         purchase = _create_purchase(user, pack)
         pay_link = f"https://pay.example.com/{purchase.id}"
         return [
             _reply_payload(f"برای {pack.coins} سکه، این لینکه:\n{pay_link}"),
-            _reply_payload("بعد از پرداخت، سکه‌ها اضافه می‌شن. هر وقت خواستی ادامه بده."),
+            _reply_payload(
+                "بعد از پرداخت، سکه‌ها اضافه می‌شن. هر وقت خواستی ادامه بده."
+            ),
         ]
     if intent.kind == "summary":
         summary = (conversation.memory_summary or "").strip()
-        text_summary = summary if summary else "خلاصه‌ای آماده نیست. هر نکته‌ای که می‌خوای مرور کنیم رو بگو."
+        text_summary = (
+            summary
+            if summary
+            else "خلاصه‌ای آماده نیست. هر نکته‌ای که می‌خوای مرور کنیم رو بگو."
+        )
         _record_user_message(conversation, text, message_meta)
         return [_reply_payload(text_summary)]
     if intent.kind == "settings":
@@ -1710,7 +2250,9 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
 
     generation = _generate_ai_reply(conversation, bot, normalized)
     if not generation:
-        bot_reply = _record_bot_message(conversation, "الان یکم کند شد؛ سریع دوباره بگو.")
+        bot_reply = _record_bot_message(
+            conversation, "الان یکم کند شد؛ سریع دوباره بگو."
+        )
         return [_reply_payload(bot_reply.text)]
 
     reply_limit = max(bot.max_output_chars, 500)
@@ -1738,7 +2280,12 @@ def _handle_message(user: User, bot: Bot | None, text: str, update: dict[str, An
             ref_id=str(bot_reply.id),
         )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("telegram_webhook: coin debit failed user=%s conv=%s error=%s", user.id, conversation.id, exc)
+        logger.exception(
+            "telegram_webhook: coin debit failed user=%s conv=%s error=%s",
+            user.id,
+            conversation.id,
+            exc,
+        )
         return _paywall_replies()
     return replies
 
@@ -1768,7 +2315,9 @@ def TelegramWebhookView(request):
     """
     secret = os.getenv("TELEGRAM_SECRET_TOKEN", "")
     got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    allow_missing_secret = _env_flag("TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False)
+    allow_missing_secret = _env_flag(
+        "TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False
+    )
 
     logger.warning(
         "telegram_webhook: hit has_secret=%s header_present=%s allow_missing_secret=%s",
@@ -1779,7 +2328,9 @@ def TelegramWebhookView(request):
 
     if secret and got != secret:
         if allow_missing_secret and not got:
-            logger.warning("telegram_webhook: secret header missing but bypass is enabled")
+            logger.warning(
+                "telegram_webhook: secret header missing but bypass is enabled"
+            )
         else:
             logger.error("telegram_webhook: forbidden secret mismatch")
             return HttpResponseForbidden("forbidden")
@@ -1798,7 +2349,11 @@ def TelegramWebhookView(request):
     try:
         replies = _handle_message(user, bot, text, payload)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("telegram_webhook: unhandled error in _handle_message user=%s error=%s", user.id, exc)
+        logger.exception(
+            "telegram_webhook: unhandled error in _handle_message user=%s error=%s",
+            user.id,
+            exc,
+        )
         replies = [_reply_payload("الان یه مشکلی پیش اومد، دوباره بفرست.")]
     chat = _extract_chat(payload)
     chat_id = chat.get("id")
@@ -1825,7 +2380,9 @@ def TelegramWebhookView(request):
         _answer_callback_query(callback_id)
 
     token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
-    return JsonResponse({"ok": True, "replies_sent": send_ok, "token_present": token_present})
+    return JsonResponse(
+        {"ok": True, "replies_sent": send_ok, "token_present": token_present}
+    )
 
 
 @csrf_exempt
@@ -1851,7 +2408,9 @@ def TelegramWebhookDiagnosticsView(request):
     return JsonResponse(
         {
             "has_secret": bool(os.getenv("TELEGRAM_SECRET_TOKEN", "")),
-            "allow_missing_secret_header": _env_flag("TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False),
+            "allow_missing_secret_header": _env_flag(
+                "TELEGRAM_ALLOW_MISSING_SECRET_HEADER", default=False
+            ),
             "telegram_bot_token_set": bool(os.getenv("TELEGRAM_BOT_TOKEN", "")),
             "ai_base_url": _get_ai_base_url(),
             "ai_model": _get_ai_model(),
